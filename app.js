@@ -808,6 +808,10 @@ function generate() {
 function regenOne(card) {
   if (!ready) return;
   touched = true;
+  // 已複製的卡片重抽＝這篇不用了，從複製紀錄移除，不再影響防撞題
+  if (card.copiedAt && RECS.some(x => x.id === card.uid)) {
+    RECS = RECS.filter(x => x.id !== card.uid); saveRecs(); drawHist(); drawPool();
+  }
   const used = newUsed(card);
   const nc = make(card.tab, used);
   cards[cards.indexOf(card)] = nc; draw(); saveCards();
@@ -828,8 +832,13 @@ function draw() {
     const msg = document.createElement('span'); msg.className = 'copied';
     const bPin = document.createElement('button'); bPin.type = 'button'; bPin.className = 'ghost small'; bPin.textContent = c.pinned ? '已保留' : '保留'; bPin.setAttribute('aria-pressed', c.pinned);
     bPin.onclick = () => { touched = true; c.pinned = !c.pinned; draw(); saveCards() };
-    const bRe = document.createElement('button'); bRe.type = 'button'; bRe.className = 'ghost small'; bRe.textContent = '重抽'; bRe.disabled = c.pinned || !!c.copiedAt || !ready;
-    bRe.onclick = () => regenOne(c);
+    const bRe = document.createElement('button'); bRe.type = 'button'; bRe.className = 'ghost small'; bRe.textContent = '重抽'; bRe.disabled = c.pinned || !ready;
+    if (c.copiedAt) bRe.title = '重抽後，這篇會從複製紀錄移除';
+    bRe.onclick = () => {
+      // 已複製的卡片要按兩次，避免誤按
+      if (c.copiedAt && bRe.dataset.confirm !== '1') { bRe.dataset.confirm = '1'; bRe.textContent = '確定重抽？'; msg.textContent = '這篇會從紀錄移除'; setTimeout(() => { bRe.dataset.confirm = ''; bRe.textContent = '重抽'; msg.textContent = '' }, 3000); return }
+      regenOne(c);
+    };
     const bCp = document.createElement('button'); bCp.type = 'button'; bCp.className = c.copiedAt ? 'ghost small' : 'copy-main small'; bCp.textContent = c.copiedAt ? '再複製一次' : '複製指令';
     bCp.onclick = () => copy(c, msg, el);
     tools.append(msg, bPin, bRe, bCp); head.appendChild(tools);
