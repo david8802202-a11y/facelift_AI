@@ -1,61 +1,1310 @@
-# facelift 開題指令產生器（GitLab 版）
+/* facelift 開題指令產生器（GitLab 版）
+ * 參數池讀同一層的「參數池.xlsx」（SheetJS 解析）；讀不到時可手動選檔，選過的檔會存在這台瀏覽器。
+ * 防撞題紀錄、複製紀錄、當天卡片都只存在這台瀏覽器（localStorage）。
+ * 本頁不呼叫任何 AI API，只產生指令文字。
+ *
+ * 區塊：常數與寫法規則 → 讀 Excel 與檢查 → 抽籤 roll() → 組指令 promptText() → 卡片 → 紀錄 → 初始化
+ */
+'use strict';
 
-替 PTT facelift 板產生「開題＋推文」的 AI 指令。產生後複製，貼到自己的 ChatGPT、Claude 或 Gemini；頁面本身不呼叫任何 API。
+/* ================= 常數與寫法規則（不在 Excel 裡，改這裡要動程式） ================= */
+const POOL_FILE = '參數池.xlsx';
+const KEY = 'facelift-'; // localStorage 前綴
+const CATS = ['電音波', '針劑', '醫美診所', '空包彈', '閒聊趣味'];
+const SHORT = {'電音波': '電音波', '針劑': '針劑', '醫美診所': '診所', '空包彈': '空包彈', '閒聊趣味': '閒聊'};
+const R = '__rand';
+// 今日配比預設（工作流程表的每日配比）
+const PRESETS = {
+  an: {'閒聊趣味': 1, '醫美診所': 1, '電音波': 1, '針劑': 0, '空包彈': 2},
+  yy: {'閒聊趣味': 1, '醫美診所': 0, '電音波': 0, '針劑': 1, '空包彈': 3},
+  all: {'閒聊趣味': 2, '醫美診所': 1, '電音波': 1, '針劑': 1, '空包彈': 5},
+};
+// 地區：城市比重與整外跨縣市比例（會被 Excel「分頁設定」覆蓋），診所名單來自 Excel「診所」分頁
+let CITY_W = {'台北': 30, '新北': 20, '桃園': 15, '台中': 15, '高雄': 15, '台南': 5};
+let CROSS_RATE = .10;
+let CLINICS = [];  // [{city, area, name, surg}]
+// Excel 沒有診所分頁時，地區改用這些（不帶診所名稱）
+const CITY_FALLBACK = {'台北': ['大安', '中山', '中正', '信義', '松山'], '新北': ['板橋'], '桃園': ['桃園'], '台中': ['西屯', '西區'], '高雄': ['左營'], '台南': ['中西區']};
+// 抱怨類的診所主軸：正文不點名診所
+const NEG_CLINIC_SCENES = ['免洗醫生', '拒絕流水線', '診所價格與推銷'];
+// 抱怨診所的困擾：抽到時正文也不點名診所
+const NEG_PAIN_RE = /欺騙|說法不一|免洗|換醫生|加價|壓迫|等候|沒有獨立|不透明|水很深|小蜜蜂|業務很多|專業度不足|分歧|推銷|敷衍|踩雷/;
+// 事件型困擾：本身是一段經過，要兩三句才講得清楚
+const EVENT_PAIN_RE = /卻|變成|臨時|前後說法|壓迫|分歧/;
+// 可以拿事件型困擾當主要內容的情境（抱怨、經驗類）；其他情境只當一句起因，或改抽非事件型困擾
+const EVENT_OK_SCENES = ['免洗醫生', '診所價格與推銷', '推廣與行銷討論', '診所流程服務探討', '責任歸屬問題'];
+// 情境說明有這些字的，結尾一定要問（要互動、要推薦、要大家討論）
+const ASK_SCENE_RE = /互動|發起話題|激辯|推薦|名單|請益|徵求|求推|大範圍的探討/;
+// 發文者選項（tone、trigger 由 Excel 填入）
+const P = {
+  gender: ['女', '女', '女', '女', '男'],
+  who: ['自己', '自己', '自己', '自己', '自己', '陪朋友去諮詢', '幫伴侶問', '幫媽媽問', '跟姊妹一起考慮'],
+  exp: ['完全沒做過醫美', '只做過雷射除斑', '打過一兩次肉毒', '每年固定打一次電音波', '做過不少療程，算老手', '做過一次但效果很差', '只在美容院做過臉'],
+  budget: ['一萬以內', '一到三萬', '三到六萬', '六萬以上', '沒概念，想先了解行情'],
+  len: ['35–90', '90–130', '130–200'],
+  tone: [],
+  trigger: [],
+};
+const TEAM_PHRASES = ['看到有人說', '想問大家', '有沒有人', '可以分享', '爬文看', '不知道', '是不是', '真的有', '會不會'];
+// 閒聊趣味、醫美診所分頁：情境有列真實品類時，配到品類（並指定療程）的機率，依舊版實際比例
+const REAL_GROUP_RATE = {'閒聊趣味': .35, '醫美診所': .20};
+// 心得情境合起來在抽籤時算幾個情境的份量（舊版 3 個心得情境）
+const SHARE_SLOTS = 3;
+// 以下預設值會被 Excel「分頁設定」「通稱文方向」「搭配組合」覆蓋
+let GEN_RATE = {'電音波': .25, '針劑': .40, '閒聊趣味': .40, '空包彈': .40, '醫美診所': .50}; // 通稱文比例
+let MULTI_RATE = .30;                         // 多療程隨機觸發機率（擔心類等情境不觸發）
+let GEN_TYPE_W = {A: 1, B: 1, C: 1};          // 通稱文三型籤數：A 全通稱、B 推文帶品牌、C 結尾問品牌
+let MULTI_TYPE_W = {AB: 1, 詢問: 1, 評估: 1};  // 多療程三型籤數
+let GDIR = [];                                // 通稱文方向 [{d, re}]
+let COMBO = [];                               // 搭配組合 [[品類, 品類, (品類)]]
+let GEN_SET = new Set();                      // 所有通稱名稱
+// 心得結論分配：紀錄、比較各 15%，其餘 70% 照滿意 45／普通 35／後悔 20
+const MOOD_W = {'紀錄': 15, '比較': 15, '滿意': 31.5, '普通': 24.5, '後悔': 14};
+const SCENE_TYPES = ['一般', '心得', '求推', '診所主軸'];
+const MOODS = ['滿意', '普通', '後悔', '紀錄', '比較'];
+const FEMALE_RE = /產後|陰道|小陰唇|私密|乳|胸|漏尿|孕斑|生理期|比基尼|伴娘|婚紗|妊娠/;
+const TOPIC_FIELDS = ['f-group', 'f-obj', 'f-pain', 'f-scene', 'f-tag'];
+const SEASON_NAME = m => m >= 3 && m <= 5 ? '春天' : m >= 6 && m <= 8 ? '夏天' : m >= 9 && m <= 11 ? '秋天' : '冬天';
 
-## 檔案
+/* ---------- 由 Excel 填入的資料 ---------- */
+let DATA = {groups: {}, tab: {}, tabPain: {}, scene: []};
+let TONE_INFO = {};      // 語氣 → {notShare, notCC}
+let TRIGGERS = [];       // [{text, m:[月份]}]
+let SEASON_RULES = [];   // [{re, m, label}]
+let SHEET_BAN = [];
+let LIB = [];            // 範例文 [{t,g,s,y,n,x}]
+let ready = false;
+let MONTH = new Date().getMonth() + 1;
 
-```
-index.html                頁面
-app.js                    抽籤、組指令、讀 Excel、紀錄
-參數池.xlsx               參數池與範例文（品類、療程、困擾、情境、語氣、觸發事件、禁用詞、季節規則、範例文）
-vendor/xlsx.full.min.js   SheetJS，用來讀 Excel（放本地，不連外部 CDN）
-.gitlab-ci.yml            GitLab Pages 部署設定
-```
+/* ---------- 小工具 ---------- */
+const $ = id => document.getElementById(id);
+const store = {
+  get(k) { try { return localStorage.getItem(KEY + k) } catch (e) { return null } },
+  set(k, v) { try { localStorage.setItem(KEY + k, v); return true } catch (e) { return false } },
+};
+const pick = a => a[Math.floor(Math.random() * a.length)];
+const rint = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+function sample(a, n) { const c = [...a]; for (let i = c.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [c[i], c[j]] = [c[j], c[i]] } return c.slice(0, n) }
+function wpick(items, w) { const t = items.reduce((s, x) => s + w(x), 0); let r = Math.random() * t; for (const x of items) { r -= w(x); if (r <= 0) return x } return items[items.length - 1] }
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c])) }
+const escRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const list = s => String(s || '').split(/[、,，\n]/).map(x => x.trim()).filter(Boolean);
+const monthsOf = s => list(s).map(x => +x.replace(/月$/, '')).filter(n => Number.isInteger(n) && n >= 1 && n <= 12);
 
-## 怎麼開
+/* ---------- 季節 ---------- */
+function inSeason(s) { return SEASON_RULES.every(r => !r.re.test(s) || r.m.includes(MONTH)) }
+function seasonPool(arr, f) { const a = arr.filter(x => inSeason(f ? f(x) : x)); return a.length ? a : arr }
 
-1. **GitLab Pages（建議）**：推到預設分支後，CI 會把檔案發布到 Pages。之後大家都用同一個網址開，頁面會自動讀同一層的 `參數池.xlsx`。
-2. **本機伺服器**：在這個資料夾執行 `python -m http.server 8000`，再開 `http://localhost:8000/`。
-3. **直接雙擊 index.html**：瀏覽器不讓頁面自己讀 Excel，頁面會出現「選擇 Excel 檔」按鈕，選 `參數池.xlsx` 即可。選過一次，這台瀏覽器會記住，之後直接開也會用它；Excel 有更新時要再選一次。
+/* ---------- 防撞題計數 ---------- */
+const TAB_FIELDS = new Set(['scene', 'group', 'obj', 'tone', 'title', 'open', 'tt']);
+const REC_FIELDS = ['scene', 'pain', 'group', 'obj', 'tone', 'title', 'open', 'trigger', 'layout', 'tt'];
+function mkU() {
+  const m = new Map(); const key = (f, t, v) => f + '|' + (TAB_FIELDS.has(f) ? t : '*') + '|' + v;
+  return {n: (f, t, v) => m.get(key(f, t, v)) || 0, add: (f, t, v, w = 1) => { if (v == null || v === '') return; const k = key(f, t, v); m.set(k, (m.get(k) || 0) + w) }};
+}
+function pickLeast(pool, f, t, U) { if (!pool.length) return undefined; let min = Infinity; pool.forEach(v => { const c = U.n(f, t, v); if (c < min) min = c }); const c = pool.filter(v => U.n(f, t, v) === min); return pick(c.length ? c : pool) }
 
-## 更新參數池
+/* ================= 讀 Excel 與檢查 ================= */
+// 依表頭文字開頭找欄位；找不到必填欄就丟錯
+function sheetRows(wb, name, cols, warns, required, optional = []) {
+  const ws = wb.Sheets[name];
+  if (!ws) {
+    if (required) throw new Error(`找不到「${name}」分頁`);
+    warns.push(`找不到「${name}」分頁，這部分視為空白`);
+    return [];
+  }
+  const start = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']).s.r : 0;
+  const rows = XLSX.utils.sheet_to_json(ws, {header: 1, defval: '', raw: false, blankrows: true});
+  const head = (rows[0] || []).map(h => String(h).trim());
+  const ix = {};
+  for (const [key, label] of Object.entries(cols)) {
+    // 欄名可以有新舊兩種寫法，用 | 分隔（例如「籤數|抽中比重」）
+    const i = head.findIndex(h => label.split('|').some(l => h.startsWith(l)));
+    if (i < 0) { if (optional.includes(key)) continue; throw new Error(`「${name}」分頁找不到「${label.split('|')[0]}」欄`) }
+    ix[key] = i;
+  }
+  const out = [];
+  rows.slice(1).forEach((r, k) => {
+    const o = {line: start + k + 2}; let any = false;
+    optional.forEach(key => { if (!(key in ix)) o[key] = '' });
+    for (const key in ix) { const v = String(r[ix[key]] ?? '').replace(/\r/g, '').trim(); o[key] = v; if (v && key !== 'on') any = true }
+    if (any) out.push(o);
+  });
+  return out;
+}
 
-- 直接改 `參數池.xlsx` 再推上 GitLab，大家重新整理頁面就會讀到新版（參數池面板會顯示檔案修改時間，也可以按「重新讀取」）。
-- 格式說明在 Excel 的「說明」分頁：每筆一列、只讀「啟用＝Y」的列、多個值用「、」分隔、品類名稱要跟「品類」分頁一字不差。
-- 讀到有問題的列（品類對不上、必填欄空白、「只配這些困擾」填了不存在的困擾、情境名稱重複等），參數池面板會出現「Excel 有 N 個地方要檢查」，展開可以看到哪個分頁第幾列。
-- 品類「診所」「閒聊」沒有療程，代表醫美診所、閒聊趣味分頁專用的困擾池；情境的「適用品類」填「診所」「閒聊」，就能在那兩個分頁抽到。
-- 「診所」分頁是各地區的醫美診所名單。只有類型是「求推」「診所主軸」的情境會依「分頁設定」的地區比重抽城市，再抽同城市 2–3 間寫進指令（整形手術類只抽「整形外科」填 Y 的，並有「整外跨縣市比例」的機會寫成跨縣市）。抱怨類診所主軸（免洗醫生、拒絕流水線、診所價格與推銷，名單在 `app.js` 的 `NEG_CLINIC_SCENES`）正文不點名，推文提到的診所只用推薦或中性說法。
+function buildPool(wb) {
+  const warns = [];
+  const W = (sheet, line, msg) => warns.push(`${sheet} 第 ${line} 列：${msg}`);
+  // 「啟用」空白當成啟用，只有填 N 才停用
+  const enabled = (sheet, o) => { if (!o.on || /^y$/i.test(o.on)) return true; if (/^n$/i.test(o.on)) return false; W(sheet, o.line, `「啟用」填了「${o.on}」，只認 Y 或 N，當成啟用`); return true };
 
-## 紀錄存在哪裡
+  // 品類
+  const allG = {};
+  sheetRows(wb, '品類', {name: '品類名稱', show: '指令裡的名稱', tabs: '出現在哪些分頁', surg: '手術類', w: '籤數|抽中比重', we: '空包彈籤數|空包彈比重', on: '啟用'}, warns, true, ['show', 'we']).forEach(o => {
+    if (!enabled('品類', o)) return;
+    if (!o.name) { W('品類', o.line, '品類名稱空白'); return }
+    if (allG[o.name]) { W('品類', o.line, `品類「${o.name}」重複，只用第一列`); return }
+    const tabs = list(o.tabs).filter(t => { if (CATS.includes(t)) return true; W('品類', o.line, `出現在哪些分頁「${t}」不是五個分頁之一`); return false });
+    if (!tabs.length) W('品類', o.line, `品類「${o.name}」沒有填出現在哪些分頁，任何分頁都抽不到`);
+    let w = null;
+    if (o.w !== '') { w = parseFloat(o.w); if (!(w >= 0)) { W('品類', o.line, `籤數「${o.w}」不是數字，改用 2`); w = null } }
+    let we = null;
+    if (o.we !== '') { we = parseFloat(o.we); if (!(we >= 0)) { W('品類', o.line, `空包彈籤數「${o.we}」不是數字，改用籤數`); we = null } }
+    allG[o.name] = {tabs, surgery: /^y$/i.test(o.surg), weight: w, emptyWeight: we, show: o.show || o.name.replace(/^.*-/, ''), objs: [], objInfo: {}, pains: [], generic: []};
+  });
 
-防撞題紀錄、複製紀錄、當天的卡片都只存在**各自的瀏覽器**（localStorage），不會上傳。所以：
+  // 療程、困擾先讀進來
+  const oRows = sheetRows(wb, '療程', {g: '品類', name: '療程名稱', nick: '板上也常叫', only: '只配這些困擾', on: '啟用'}, warns, true).filter(o => enabled('療程', o));
+  const pRows = sheetRows(wb, '困擾', {g: '品類', pain: '困擾', on: '啟用'}, warns, true).filter(o => enabled('困擾', o));
+  oRows.forEach(o => {
+    if (!o.g) { W('療程', o.line, '品類空白'); return }
+    if (!allG[o.g]) { W('療程', o.line, `品類「${o.g}」不在品類分頁（或已停用）`); return }
+    if (!o.name) { W('療程', o.line, '療程名稱空白'); return }
+    const G = allG[o.g];
+    if (G.objs.includes(o.name)) { W('療程', o.line, `療程「${o.name}」在同一品類重複`); return }
+    G.objs.push(o.name); G.objInfo[o.name] = {nick: list(o.nick).filter(n => n !== o.name), only: list(o.only), line: o.line};
+  });
 
-- 同事之間的紀錄不互通，可能互相撞題。
-- 用 Pages 網址開跟直接雙擊檔案開，是兩份不同的紀錄；請固定用同一種方式開。
-- 換瀏覽器、無痕視窗、清除網站資料，紀錄就會不見。
-- 「清除本機紀錄」只清這台瀏覽器的紀錄。
+  // 通稱：通稱文用的療程名稱；療程分頁裡跟通稱同名的列不當品牌抽
+  sheetRows(wb, '通稱', {g: '品類', name: '通稱名稱', on: '啟用'}, warns, false).forEach(o => {
+    if (!enabled('通稱', o)) return;
+    if (!allG[o.g]) { W('通稱', o.line, `品類「${o.g}」不在品類分頁（或已停用）`); return }
+    if (!o.name) { W('通稱', o.line, '通稱名稱空白'); return }
+    const G = allG[o.g]; if (!G.generic.includes(o.name)) G.generic.push(o.name);
+    G.objs = G.objs.filter(n => n !== o.name);
+  });
 
-## 隱私
+  // 沒有療程、只出現在診所／閒聊分頁的品類（「診所」「閒聊」）＝分頁專用的困擾池
+  const groups = {}, pseudo = {};
+  Object.entries(allG).forEach(([g, v]) => {
+    if (!v.objs.length && v.tabs.length && v.tabs.every(t => t === '醫美診所' || t === '閒聊趣味')) pseudo[g] = v.tabs;
+    else groups[g] = v;
+  });
+  const tab = {}; CATS.forEach(c => tab[c] = Object.keys(groups).filter(g => groups[g].tabs.includes(c)));
+  const tabPain = {};
+  Object.values(pseudo).forEach(ts => ts.forEach(t => tabPain[t] = tabPain[t] || []));
+  pRows.forEach(o => {
+    if (!o.g) { W('困擾', o.line, '品類空白'); return }
+    if (!o.pain) { W('困擾', o.line, '困擾空白'); return }
+    if (groups[o.g]) { if (!groups[o.g].pains.includes(o.pain)) groups[o.g].pains.push(o.pain) }
+    else if (pseudo[o.g]) pseudo[o.g].forEach(t => { if (!tabPain[t].includes(o.pain)) tabPain[t].push(o.pain) });
+    else W('困擾', o.line, `品類「${o.g}」不在品類分頁（或已停用）`);
+  });
+  // 只配這些困擾：要對得到同品類的困擾
+  Object.entries(groups).forEach(([g, G]) => Object.entries(G.objInfo).forEach(([o, info]) => {
+    const bad = info.only.filter(p => !G.pains.includes(p));
+    if (bad.length) W('療程', info.line, `「${o}」只配的困擾「${bad.join('、')}」不在「${g}」的困擾裡，已忽略`);
+    info.only = info.only.filter(p => G.pains.includes(p));
+    if (!info.only.length) delete info.only;
+  }));
 
-`參數池.xlsx` 的範例文是公司過往實際發過的口碑文，連結外流等於公開經營過的帳號與貼文。
+  // 通稱文方向
+  const gdir = [];
+  sheetRows(wb, '通稱文方向', {name: '方向', d: '給 AI 看的說明', kw: '優先配這些情境', on: '啟用'}, warns, false).forEach(o => {
+    if (!enabled('通稱文方向', o) || !o.name) return;
+    const kw = list(o.kw);
+    gdir.push({d: o.d ? `${o.name}：${o.d}` : o.name, re: kw.length ? new RegExp(kw.map(escRe).join('|')) : null});
+  });
+  // 搭配組合（多療程詢問用）
+  const combo = [];
+  sheetRows(wb, '搭配組合', {a: '品類 1', b: '品類 2', c: '品類 3', on: '啟用'}, warns, false, ['c']).forEach(o => {
+    if (!enabled('搭配組合', o)) return;
+    const c = [o.a, o.b, o.c].filter(Boolean);
+    const bad = c.filter(g => !groups[g]);
+    if (bad.length) { W('搭配組合', o.line, `品類「${bad.join('、')}」不在品類分頁（或沒有療程），這組略過`); return }
+    if (c.length < 2) { W('搭配組合', o.line, '至少要填兩個品類'); return }
+    combo.push(c);
+  });
+  // 分頁設定
+  const conf = {gen: {}, multi: null, genW: {}, multiW: {}, cityW: {}, cross: null};
+  const pct = v => { const s = String(v).trim(); if (!s) return NaN; const n = parseFloat(s); return /%$/.test(s) ? n / 100 : n > 1 ? n / 100 : n };
+  sheetRows(wb, '分頁設定', {k: '設定項目', tab: '分頁', v: '數值', on: '啟用'}, warns, false, ['on']).forEach(o => {
+    if (!enabled('分頁設定', o) || !o.k) return;
+    if (/^地區比重/.test(o.k)) { const n = parseFloat(o.v); if (!o.tab) W('分頁設定', o.line, '地區比重要在「分頁」欄填城市'); else if (n >= 0) conf.cityW[o.tab] = n; else W('分頁設定', o.line, `數值「${o.v}」不是數字`); return }
+    if (/^整外跨縣市/.test(o.k)) { const v = pct(o.v); if (v >= 0 && v <= 1) conf.cross = v; else W('分頁設定', o.line, `數值「${o.v}」看不懂，要填 0%–100%`); return }
+    if (/^通稱文\s*[ABC]/.test(o.k)) { const n = parseFloat(o.v); if (n >= 0) conf.genW[o.k.match(/[ABC]/)[0]] = n; else W('分頁設定', o.line, `數值「${o.v}」不是數字`); return }
+    if (/^多療程\s*(AB|詢問|評估)/.test(o.k)) { const n = parseFloat(o.v); if (n >= 0) conf.multiW[o.k.match(/AB|詢問|評估/)[0]] = n; else W('分頁設定', o.line, `數值「${o.v}」不是數字`); return }
+    const v = pct(o.v);
+    if (!(v >= 0 && v <= 1)) { W('分頁設定', o.line, `數值「${o.v}」看不懂，要填 0%–100%`); return }
+    if (/^通稱文比例/.test(o.k)) { if (CATS.includes(o.tab)) conf.gen[o.tab] = v; else W('分頁設定', o.line, `分頁「${o.tab}」不是五個分頁之一`) }
+    else if (/^多療程比例/.test(o.k)) conf.multi = v;
+    else W('分頁設定', o.line, `設定項目「${o.k}」看不懂，已略過`);
+  });
 
-- 專案請設成 **Private** 或 **Internal**。
-- 開 GitLab Pages 時，請 IT 確認有開啟 **Pages 存取控制**（Settings → General → Visibility → Pages 設成 Only Project Members），否則 Pages 網址任何人都打得開。
-- 頁面已加 `noindex`，但這不能取代存取控制。
+  // 診所名單（選填分頁）
+  const clinics = []; const seenClinic = new Set();
+  sheetRows(wb, '診所', {city: '城市', area: '區域', name: '診所名稱', surg: '整形外科', on: '啟用'}, warns, false, ['surg']).forEach(o => {
+    if (!enabled('診所', o)) return;
+    if (!o.city || !o.name) { W('診所', o.line, '城市或診所名稱空白'); return }
+    const k = o.city + '|' + o.area + '|' + o.name;
+    if (seenClinic.has(k)) { W('診所', o.line, `「${o.city} ${o.area} ${o.name}」重複，只用第一列`); return }
+    seenClinic.add(k);
+    clinics.push({city: o.city, area: o.area, name: o.name, surg: /^y$/i.test(o.surg)});
+  });
+  if (clinics.length) {
+    const cities = [...new Set(clinics.map(c => c.city))];
+    if (Object.keys(conf.cityW).length) {
+      cities.filter(c => !(c in conf.cityW)).forEach(c => warns.push(`診所分頁的城市「${c}」在分頁設定沒有地區比重，抽不到`));
+      Object.keys(conf.cityW).filter(c => !cities.includes(c)).forEach(c => warns.push(`分頁設定的地區比重「${c}」在診所分頁沒有任何診所`));
+    }
+  }
 
-## 不在 Excel 裡、要改程式的規則
+  // 情境
+  const scene = []; const seen = {};
+  sheetRows(wb, '情境', {name: '情境名稱', dir: '給 AI 看的方向', desc: '情境說明', gs: '適用品類', noSurg: '不配手術', type: '類型', mood: '心得結論', on: '啟用'}, warns, true).forEach(o => {
+    if (!enabled('情境', o)) return;
+    if (!o.name) { W('情境', o.line, '情境名稱空白'); return }
+    let name = o.name;
+    if (seen[name]) { seen[name]++; name = `${o.name}-${seen[o.name]}`; W('情境', o.line, `情境名稱「${o.name}」重複（第 ${seen[o.name + '#line']} 列也有），這列暫時當成「${name}」，建議在 Excel 改名`) }
+    else { seen[name] = 1; seen[name + '#line'] = o.line }
+    const entries = list(o.gs);
+    if (!entries.length) { W('情境', o.line, `情境「${name}」沒有填適用品類，抽不到`); return }
+    const tabs = new Set(); const real = []; let all = false;
+    entries.forEach(e => {
+      if (e === '全部') { all = true; CATS.forEach(t => tabs.add(t)); return }
+      if (groups[e]) { real.push(e); groups[e].tabs.forEach(t => tabs.add(t)) }
+      else if (pseudo[e]) pseudo[e].forEach(t => tabs.add(t));
+      else W('情境', o.line, `適用品類「${e}」不在品類分頁（或已停用），已忽略`);
+    });
+    let type = o.type || '一般';
+    if (!SCENE_TYPES.includes(type)) { W('情境', o.line, `類型「${type}」看不懂，當成一般`); type = '一般' }
+    let mood = o.mood || null;
+    if (mood && !MOODS.includes(mood)) { W('情境', o.line, `心得結論「${mood}」看不懂，改成隨機`); mood = null }
+    if (type === '心得' && !mood) W('情境', o.line, `心得類情境「${name}」沒填心得結論，會隨機`);
+    if (!o.dir) W('情境', o.line, `情境「${name}」沒填給 AI 看的方向，改用情境名稱`);
+    const s = {name, dir: o.dir || name, desc: o.desc || o.dir || name, cats: CATS.filter(t => tabs.has(t)), type, share: type === '心得', mood: type === '心得' ? mood : null};
+    if (!all) s.only = real;
+    if (/^y$/i.test(o.noSurg)) s.noSurg = true;
+    if (!s.cats.length) { W('情境', o.line, `情境「${name}」對不到任何分頁，抽不到`); return }
+    scene.push(s);
+  });
 
-`app.js` 開頭的常數區：分頁、今日配比預設（小安、育佑、兩人合計）、抱怨類診所主軸名單（`NEG_CLINIC_SCENES`）、性別、誰的問題、醫美經歷、預算、閒聊／診所分頁配到品類的機率（`REAL_GROUP_RATE`）、心得文份量（`SHARE_SLOTS`）與心得結論比例（`MOOD_W`）。字數、標題、標點、推文安排等寫法比例在 `roll()` 裡，依過往 1,221 篇發文統計，改動前請先確認資料依據。
+  // 語氣
+  const tones = [];
+  sheetRows(wb, '語氣', {text: '語氣', not: '不要用在', on: '啟用'}, warns, true).forEach(o => {
+    if (!enabled('語氣', o)) return;
+    if (!o.text) { W('語氣', o.line, '語氣空白'); return }
+    if (o.not && !/心得|閒聊|診所/.test(o.not)) W('語氣', o.line, `不要用在「${o.not}」看不懂，可填「不用在心得文」或「不用在閒聊和診所」`);
+    tones.push({text: o.text, notShare: /心得/.test(o.not), notCC: /閒聊|診所/.test(o.not)});
+  });
+  // 觸發事件
+  const triggers = [];
+  sheetRows(wb, '觸發事件', {text: '事件', m: '只在這些月份', on: '啟用'}, warns, true).forEach(o => {
+    if (!enabled('觸發事件', o)) return;
+    if (!o.text) { W('觸發事件', o.line, '事件空白'); return }
+    const m = monthsOf(o.m);
+    if (o.m && !m.length) W('觸發事件', o.line, `月份「${o.m}」看不懂，當成不限月份`);
+    triggers.push({text: o.text, m});
+  });
+  // 禁用詞
+  const ban = [];
+  sheetRows(wb, '禁用詞', {text: '禁用詞', on: '啟用'}, warns, false).forEach(o => { if (enabled('禁用詞', o) && !ban.includes(o.text)) ban.push(o.text) });
+  // 季節規則
+  const season = [];
+  sheetRows(wb, '季節規則', {kw: '關鍵字', m: '只在這些月份出現', label: '說明', on: '啟用'}, warns, false).forEach(o => {
+    if (!enabled('季節規則', o)) return;
+    const kw = list(o.kw), m = monthsOf(o.m);
+    if (!kw.length) { W('季節規則', o.line, '關鍵字空白'); return }
+    if (!m.length) { W('季節規則', o.line, `月份「${o.m}」看不懂，這條規則略過`); return }
+    season.push({re: new RegExp(kw.map(escRe).join('|')), m, label: o.label || kw.join('、')});
+  });
+  // 範例文
+  const lib = []; const badG = {};
+  sheetRows(wb, '範例文', {t: '標籤', g: '品類', s: '跟診所有關', y: '年份', x: '全文', on: '啟用'}, warns, true).forEach(o => {
+    if (!enabled('範例文', o)) return;
+    const x = o.x.replace(/\n{3,}/g, '\n\n').trim();
+    if (!x) { W('範例文', o.line, '全文空白'); return }
+    const tm = x.match(/^\[([^\]]+)\]/);
+    if (!tm) W('範例文', o.line, '第一行不是「[標籤] 標題」的格式');
+    const g = list(o.g).filter(v => { if (groups[v] || pseudo[v]) return true; (badG[v] = badG[v] || []).push(o.line); return false });
+    lib.push({t: o.t || (tm ? tm[1] : ''), g, s: /^y$/i.test(o.s) ? 1 : 0, y: o.y || '', n: exBody(x).replace(/\s/g, '').length, x});
+  });
+  Object.entries(badG).forEach(([v, lines]) => warns.push(`範例文 第 ${lines.slice(0, 5).join('、')}${lines.length > 5 ? ' 等' : ''} 列：品類「${v}」不在品類分頁，已忽略`));
 
-## 更新 SheetJS
+  // 整體檢查
+  Object.entries(groups).forEach(([g, v]) => {
+    if (!v.objs.length) warns.push(`品類「${g}」沒有任何療程`);
+    if (!v.pains.length) warns.push(`品類「${g}」沒有任何困擾，抽到時改用通用困擾`);
+  });
+  CATS.forEach(c => { if (!scene.some(s => s.cats.includes(c))) warns.push(`分頁「${c}」沒有任何情境，這個分頁暫時不能產生`) });
+  if (!tones.length) throw new Error('「語氣」分頁沒有任何啟用的語氣');
+  if (!triggers.length) throw new Error('「觸發事件」分頁沒有任何啟用的事件');
+  if (lib.length < 2) throw new Error('「範例文」分頁至少要有 2 篇啟用的範例');
+  return {data: {groups, tab, tabPain, scene}, tones, triggers, ban, season, lib, gdir, combo, conf, clinics, warns};
+}
 
-目前放的是 npm 上的 SheetJS 0.18.5。這版有兩個已知漏洞（CVE-2023-30533、CVE-2024-22363），都要讀到刻意做壞的檔案才會觸發；這裡只讀自己的 Excel，風險很低，但建議換成官方新版：
+function applyPool(res) {
+  DATA = res.data;
+  TONE_INFO = {}; res.tones.forEach(t => TONE_INFO[t.text] = t);
+  P.tone = res.tones.map(t => t.text);
+  TRIGGERS = res.triggers; P.trigger = res.triggers.map(t => t.text);
+  SEASON_RULES = res.season; SHEET_BAN = res.ban; LIB = res.lib;
+  if (res.gdir.length) GDIR = res.gdir;
+  if (res.combo.length) COMBO = res.combo;
+  Object.assign(GEN_RATE, res.conf.gen); if (res.conf.multi != null) MULTI_RATE = res.conf.multi;
+  Object.assign(GEN_TYPE_W, res.conf.genW); Object.assign(MULTI_TYPE_W, res.conf.multiW);
+  GEN_SET = new Set(Object.values(DATA.groups).flatMap(g => g.generic));
+  CLINICS = res.clinics;
+  if (Object.keys(res.conf.cityW).length) CITY_W = res.conf.cityW;
+  if (res.conf.cross != null) CROSS_RATE = res.conf.cross;
+  poolWarns = res.warns;
+  opts('f-tone', P.tone); opts('f-trigger', P.trigger);
+  syncTopic(); syncRegion();
+}
 
-1. 下載 `https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js`
-2. 覆蓋 `vendor/xlsx.full.min.js`，檔名不用改。
+/* ---------- 讀檔：先讀同一層，讀不到用手動選的檔（存在 IndexedDB） ---------- */
+let poolWarns = [], poolSig = '', poolSource = '';
+const IDB = {
+  open() { return new Promise((ok, no) => { try { const q = indexedDB.open('facelift-prompt', 1); q.onupgradeneeded = () => q.result.createObjectStore('pool'); q.onsuccess = () => ok(q.result); q.onerror = () => no(q.error) } catch (e) { no(e) } }) },
+  async get() { try { const db = await this.open(); return await new Promise(ok => { const q = db.transaction('pool').objectStore('pool').get('last'); q.onsuccess = () => ok(q.result || null); q.onerror = () => ok(null) }) } catch (e) { return null } },
+  async put(v) { try { const db = await this.open(); await new Promise(ok => { const tx = db.transaction('pool', 'readwrite'); tx.objectStore('pool').put(v, 'last'); tx.oncomplete = ok; tx.onerror = ok }) } catch (e) {} },
+};
+function fmtDate(ts) { const d = new Date(ts); return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` }
+function setStatus(kind, text) {
+  const s = $('pool-status'); s.className = 'status' + (kind ? ' ' + kind : ''); s.textContent = text;
+  // 頁首的參數池狀態（一行）
+  const pill = $('pool-pill'); if (pill) { pill.className = 'pool-pill' + (kind ? ' ' + kind : ''); $('pool-pill-text').textContent = '參數池：' + text }
+}
+function setMsg(t) { $('pool-msg').textContent = t || '' }
 
-## 已知限制
+// 回傳 true 表示成功套用
+function useBuffer(buf, meta) {
+  if (typeof XLSX === 'undefined') { setStatus('warn', '少了 SheetJS'); setMsg('找不到 vendor/xlsx.full.min.js，請確認 vendor 資料夾跟 index.html 放在一起。'); return false }
+  let res;
+  try { res = buildPool(XLSX.read(new Uint8Array(buf), {type: 'array'})) }
+  catch (e) { setStatus('warn', 'Excel 有誤'); setMsg(`${meta.name}：${e.message}。${ready ? '沿用目前的資料。' : '請修正後按「重新讀取」，或選另一個檔。'}`); return false }
+  const sig = buf.byteLength + ':' + (meta.mtime || '') + ':' + res.lib.length + ':' + res.data.scene.length;
+  const changed = sig !== poolSig; poolSig = sig; poolSource = meta.source;
+  if (changed) applyPool(res); else poolWarns = res.warns;
+  const label = {server: `已讀取 ${POOL_FILE}`, manual: `已讀取 ${meta.name}`, cache: `使用 ${fmtDate(meta.pickedAt)} 選的檔`}[meta.source];
+  setStatus(res.warns.length ? 'warn' : 'ok', label + (res.warns.length ? `（${res.warns.length} 個問題）` : ''));
+  $('pool-time').textContent = meta.mtime ? '檔案修改於 ' + fmtDate(meta.mtime) : '';
+  const first = !ready; ready = true; $('go').disabled = false; if ($('go-m')) $('go-m').disabled = false;
+  drawPool();
+  if (first && !touched) generate();
+  return true;
+}
+async function loadPool() {
+  setStatus('', '讀取中…'); setMsg('');
+  try {
+    if (location.protocol === 'file:') throw new Error('file');
+    const res = await fetch('./' + encodeURIComponent(POOL_FILE), {cache: 'no-cache'});
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const buf = await res.arrayBuffer();
+    const lm = res.headers.get('Last-Modified');
+    if (useBuffer(buf, {source: 'server', name: POOL_FILE, mtime: lm ? Date.parse(lm) : null})) return;
+    return;
+  } catch (e) { /* 直接開檔（file://）或檔案不在，改用快取或手動選檔 */ }
+  const fileMode = location.protocol === 'file:';
+  const why = fileMode ? '直接開檔時瀏覽器不讓頁面讀取 Excel' : `讀不到同一層的 ${POOL_FILE}`;
+  if (ready && poolSource !== 'server') { setStatus('', poolSource === 'cache' ? '沿用上次選的檔' : '沿用手動選的檔'); setMsg(`${why}。Excel 有更新的話，請按「選擇 Excel 檔」重新選。`); return }
+  const cached = await IDB.get();
+  if (cached && cached.buf && useBuffer(cached.buf, {source: 'cache', name: cached.name, mtime: cached.mtime, pickedAt: cached.pickedAt})) {
+    setMsg(`${why}，改用上次在這台瀏覽器選的「${cached.name}」。Excel 有更新的話，請按「選擇 Excel 檔」重新選。`);
+    return;
+  }
+  setStatus('warn', '還沒有參數池');
+  setMsg(`${why}。請按「選擇 Excel 檔」，選 ${POOL_FILE}；選過一次之後，這台瀏覽器會記住。`);
+  $('pick-box').hidden = false;
+  drawPool();
+}
+async function onPickFile(file) {
+  if (!file) return;
+  const buf = await file.arrayBuffer();
+  if (useBuffer(buf, {source: 'manual', name: file.name, mtime: file.lastModified})) {
+    $('pick-box').hidden = true;
+    setMsg('這台瀏覽器已記住這個檔，下次直接開頁面也會用它。Excel 有更新時，再按「選擇 Excel 檔」選一次。');
+    IDB.put({buf, name: file.name, mtime: file.lastModified, pickedAt: Date.now()});
+  }
+}
 
-- AI 不一定照指令做（例如把推文拆成兩行），產出後仍需人工檢查。
-- 每篇指令都要開新對話貼上，同一個對話連續貼會越寫越像。
-- 「單純改寫」模式、相似度檢查尚未製作。
+/* ================= 選單 ================= */
+function opts(id, items, randLabel, extra) {
+  const el = $(id); const keep = el.value; el.innerHTML = '';
+  const add = (v, t) => { const x = document.createElement('option'); x.value = v; x.textContent = t; el.appendChild(x) };
+  add(R, randLabel || '隨機'); (extra || []).forEach(([v, t]) => add(v, t)); items.forEach(v => add(v, v));
+  el.value = [...el.options].some(o => o.value === keep) ? keep : R; mark(el);
+}
+function mark(el) { el.classList.toggle('rand', el.value === R); el.classList.toggle('fixed', el.value !== R && el.id !== 'f-region'); updateBadge() }
+// 進階設定裡的月份、地區不算「指定」，也不會被「全部改回隨機」動到
+const advSelects = () => [...document.querySelectorAll('#adv select')].filter(s => s.id !== 'f-month' && s.id !== 'f-region');
+function updateBadge() {
+  const n = advSelects().filter(s => s.value !== R).length;
+  const b = $('fixed-badge'); b.hidden = !n; b.textContent = '已指定 ' + n + ' 項';
+}
+const groupsOf = t => DATA.tab[t] || [];
+const scenesOf = t => DATA.scene.filter(s => s.cats.includes(t));
+function sceneOk(s, g) { if (!g) return true; if (s.only && !s.only.includes(g)) return false; if (s.noSurg && DATA.groups[g] && DATA.groups[g].surgery) return false; return true }
+const isAsk = s => s.type === '求推';
+
+function syncTopic() {
+  const gs = groupsOf(tab);
+  const gEl = $('f-group');
+  opts('f-group', gs, gs.length ? '隨機' : '依情境自動');
+  gEl.disabled = !gs.length;
+  const g = gEl.value !== R ? gEl.value : null;
+  const objPool = g ? DATA.groups[g].objs : [...new Set(gs.flatMap(k => DATA.groups[k].objs))];
+  opts('f-obj', objPool, gs.length ? '隨機' : '依情境自動', gs.length ? [['__none', '不指定療程']] : []);
+  $('f-obj').disabled = !gs.length;
+  const painPool = g ? DATA.groups[g].pains : (gs.length ? [...new Set(gs.flatMap(k => DATA.groups[k].pains))] : (DATA.tabPain[tab] || []));
+  opts('f-pain', painPool);
+  opts('f-scene', scenesOf(tab).filter(s => sceneOk(s, g)).map(s => s.name));
+  opts('f-tag', ['討論', '閒聊', '問題', '詢問', '心得'], '依情境自動');
+}
+function syncTabs() { CATS.forEach(c => $('tab-' + c).setAttribute('aria-selected', c === tab)) }
+function syncMode() {
+  $('mode-single').setAttribute('aria-pressed', mode === 'single'); $('mode-mix').setAttribute('aria-pressed', mode === 'mix');
+  $('single-box').hidden = mode !== 'single'; $('mix-box').hidden = mode !== 'mix';
+  TOPIC_FIELDS.forEach(id => { $(id).closest('.row').style.opacity = mode === 'mix' ? .45 : 1 });
+}
+// 可抽的城市：有比重、而且有診所（沒有診所分頁時用內建地區）
+function regionCities() {
+  const has = CLINICS.length ? new Set(CLINICS.map(c => c.city)) : new Set(Object.keys(CITY_FALLBACK));
+  return Object.keys(CITY_W).filter(c => has.has(c) && CITY_W[c] > 0);
+}
+function syncRegion() {
+  const cs = regionCities();
+  opts('f-region', cs, '依比重隨機', [['__none', '不帶地區']]);
+  const sel = $('f-region').value;
+  const tot = cs.reduce((s, c) => s + CITY_W[c], 0) || 1;
+  const n = c => CLINICS.length ? `${new Set(CLINICS.filter(x => x.city === c).map(x => x.name)).size} 間` : '';
+  $('region-now').textContent = sel === '__none' ? '這批不會出現地區和診所。'
+    : sel !== R ? `城市固定為${sel}${CLINICS.length ? `（${n(sel)}診所）` : ''}。求推、診所主軸類會從這裡抽診所。`
+    : `求推、診所主軸類依比重抽城市：${cs.map(c => `${c} ${Math.round(CITY_W[c] / tot * 100)}%`).join('、')}`;
+}
+
+/* ================= 抽籤 ================= */
+function fixed(id, t) {
+  if (mode === 'mix' && TOPIC_FIELDS.includes(id)) return null;
+  if (TOPIC_FIELDS.includes(id) && t !== tab) return null;
+  const v = $(id).value; return v === R ? null : v;
+}
+function groupOfObj(o, t) { return groupsOf(t).find(k => DATA.groups[k].objs.includes(o)) }
+function groupOfPain(p, t) { return groupsOf(t).filter(k => DATA.groups[k].pains.includes(p)) }
+const gShow = g => (DATA.groups[g] && DATA.groups[g].show) || String(g || '').replace(/^.*-/, '');
+const nickOf = (g, o) => (DATA.groups[g] && DATA.groups[g].objInfo[o] && DATA.groups[g].objInfo[o].nick) || [];
+function objFits(g, o, p) { const info = DATA.groups[g] && DATA.groups[g].objInfo[o]; return !info || !info.only || info.only.includes(p) }
+
+/* ---------- 範例挑選 ---------- */
+const TAGMAP = {'疑問': '問題', '請益': '問題', '分享': '心得'};
+const usedEx = new Set();
+const FILLER = new Set(['同問', '謝謝分享', '我也想問', '是', '對', '推', '推推', '蹲', '蹲蹲', '卡', '卡個', '卡一下', '可以', '可吧', '沒差', '想知道', '好奇', '我也想知道', '同樓上', '樓上', '幫推', '先推', '哈哈', '哈哈哈', '哈哈哈哈', '推一個', '真的', '對啊', '是喔', '喔喔', '+1', '同感', '我也是', '我也覺得']);
+// 提到具體診所或醫師名字的推文（例如「XX診所」「王醫師」），範例清理時刪掉
+const DOCTOR_NAME = /(^|[^這那哪每各某好的任])[王李張陳林黃吳劉蔡楊許鄭謝郭洪曾邱廖賴周徐蘇葉莊呂江蕭羅潘簡朱鍾彭游詹胡沈余趙盧梁顏柯孫魏翁戴范宋鄧杜傅侯曹薛丁馬蔣唐卓藍馮姚董紀歐汪湯姜鄒涂巫韓龔嚴袁鐘阮陸倪邵][一-鿿]?(醫師|醫生)/;
+// 「診所」前一個字是這些的，視為泛稱（好診所、很多診所、不同診所、皮膚科診所…），不刪
+const GENERIC_CLINIC = /[多好有同原科下些間家種個的去到在跟問找推是麼大小新舊別每各這那哪其般鎖美線該此]$/;
+function namesClinic(b) {
+  if (DOCTOR_NAME.test(b)) return true;
+  const m = b.match(/([一-鿿A-Za-z]{2,6})診所/);
+  return !!(m && !GENERIC_CLINIC.test(m[1]));
+}
+function cleanEx(x) {
+  let inC = false;
+  return x.split('\n').map(l => {
+    if (/^(推|噓)\|/.test(l)) inC = true;
+    if (!inC || !l.trim()) return l;
+    const m = l.match(/^((?:推|噓)\|)?\s*(.*)$/);
+    const b = m[2].replace(/\s*\+1\s*/g, '').trim();
+    if (FILLER.has(b.replace(/[!！~～.。]+$/, '')) || b.length <= 1) return null;
+    if (namesClinic(b)) return null;
+    return (m[1] || '') + b;
+  }).filter(l => l !== null).map((l, i) => i ? l.replace(/\s*\+1\s*$/, '') : l).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+const HELP_RE = /幫問|代問|代PO|代po|代Po|代友|幫朋友問|幫.{0,3}問|代.{0,4}發|[\(（]代/;
+function exBody(x) { const L = x.split('\n'); const i = L.findIndex((l, k) => k > 0 && /^(推|噓)\|/.test(l)); return L.slice(1, i < 0 ? L.length : i).join('\n').trim() }
+function exStyle(b) { if (/[，、！；]/.test(b)) return /[一-鿿] [一-鿿]/.test(b) ? 'fullspace' : 'full'; if (/[一-鿿][,!]/.test(b)) return 'half'; if (/[一-鿿] [一-鿿]/.test(b)) return 'space'; return 'line' }
+function exConflict(r, x) {
+  const b = exBody(x); let s = 0;
+  if (r.noOpenWord && /^(最近|如題)/.test(b)) s -= 8;
+  if (/[（(](?!幫問|代)[^）)]{1,30}[）)]/.test(b)) s -= 6;
+  if (!r.emo && /XD|@@|QQ|==|><|\^\^/.test(b)) s -= 4;
+  if (!r.dots && /\.\./.test(b)) s -= 2;
+  const st = exStyle(b); if (st === r.punct) s += 4; else if ((st === 'full' || st === 'fullspace') && (r.punct === 'full' || r.punct === 'fullspace')) s += 2;
+  return s;
+}
+function pickExamples(r, avoid) {
+  const tagOf = e => TAGMAP[e.t] || e.t;
+  const score = e => {
+    let s = 0;
+    if (r.group && e.g.includes(r.group)) s += 6;
+    // 診所分頁、診所主軸：優先挑跟診所有關的範例
+    if ((r.tab === '醫美診所' || r.clinicAxis) && e.s) s += 6;
+    if (tagOf(e) === r.tag) s += 3;
+    // 字數越接近越好；差太多（例如 300 字的範例配 45 字的題目）扣分
+    { const d = Math.abs(e.n - r.len); s += d < 35 ? 3 : d < 80 ? 1 : -Math.min(8, (d - 80) / 40) }
+    if (e.y === '2026') s += 1;
+    if (avoid.has(e.x)) s -= 20;
+    if (!inSeason(e.x)) s -= 12;
+    const eh = HELP_RE.test(e.x);
+    if (eh && !(r.helping && r.who !== '跟姊妹一起考慮')) s -= 40;
+    if (eh && r.helping) s += 3;
+    if (r.share && tagOf(e) === '心得') s += 6;
+    s += exConflict(r, e.x);
+    return s + Math.random() * 2.5;
+  };
+  // 每篇只評一次分再排序（隨機加分固定在這次）
+  const ranked = LIB.map(e => [score(e), e]).sort((a, b) => b[0] - a[0]).map(x => x[1]);
+  const first = ranked[0];
+  const okHelp = e => !HELP_RE.test(e.x) || (r.helping && r.who !== '跟姊妹一起考慮');
+  const second = ranked.find(e => e !== first && okHelp(e) && tagOf(e) === r.tag && !(r.group && e.g.includes(r.group)) && !avoid.has(e.x) && exConflict(r, e.x) >= 0) || ranked.find(e => e !== first && okHelp(e));
+  const out = [first, second].filter(Boolean).map(e => e.x); out.forEach(x => avoid.add(x)); return out.map(cleanEx);
+}
+
+// 多療程：AB 比較／多療程評估挑適合同一個困擾的；多療程詢問只用「搭配組合」
+function multiItems(type, r, t, used) {
+  const gs = groupsOf(t).filter(g => DATA.groups[g]);
+  const namesOf = g => {
+    const G = DATA.groups[g]; if (!G) return [];
+    if (r.generic) { const a = G.generic.filter(o => objFits(g, o, r.pain)); if (a.length) return a }
+    return G.objs.filter(o => objFits(g, o, r.pain));
+  };
+  const out = []; const has = n => out.some(o => o.n === n || o.n.includes(n) || n.includes(o.n));
+  const add = (g, filter) => { let c = namesOf(g).filter(n => !has(n)); if (filter) c = c.filter(filter); if (!c.length) return false; out.push({n: pickLeast(c, 'obj', t, used), g}); return true };
+  if (r.obj) out.push({n: r.obj, g: r.group}); else if (!add(r.group)) return null;
+  if (type === '詢問') {
+    const combos = COMBO.filter(c => c.includes(r.group) && c.every(g => gs.includes(g)));
+    if (!combos.length) type = 'AB';
+    else {
+      const c = pick(combos);
+      if (c.length === 2 && c[0] === c[1]) { const a = out[0].n; const want = /音波/.test(a) ? '電波' : /電波/.test(a) ? '音波' : null; if (!want || !add(r.group, n => n.includes(want))) type = 'AB' }
+      else c.filter(g => g !== r.group).forEach(g => add(g));
+      if (type === '詢問' && out.length < 2) type = 'AB';
+    }
+  }
+  if (type !== '詢問') {
+    const pg = gs.filter(g => g !== r.group && DATA.groups[g].pains.includes(r.pain));
+    const want = type === '評估' && Math.random() < .5 ? 3 : 2;
+    let guard = 0;
+    while (out.length < want && guard++ < 6) {
+      const cross = pg.length && Math.random() < .5;
+      if (!(cross ? add(pick(pg)) : add(r.group))) { if (!add(r.group) && !(pg.length && pg.some(g => add(g)))) break }
+    }
+  }
+  return out.length >= 2 ? {type, items: out} : null;
+}
+
+/* ---------- 地區與診所 ---------- */
+const isClinicAxis = s => s.type === '求推' || s.type === '診所主軸';
+const placeName = (city, area) => !area || area === city ? city : `${city} ${area}`;
+function pickCity(cities, exclude) { const c = cities.filter(x => x !== exclude && (CITY_W[x] || 0) > 0); return c.length ? wpick(c, x => CITY_W[x]) : null }
+// 從某個城市抽 2–3 間：先抽一個區（診所多的區比較常抽到），同區不夠再從同城市補；避開最近用過的
+function pickClinics(city, surg, t, used) {
+  let pool = CLINICS.filter(c => c.city === city && (!surg || c.surg));
+  if (!pool.length) pool = CLINICS.filter(c => c.city === city);
+  if (!pool.length) return null;
+  const area = pick(pool).area;
+  const inArea = [...new Set(pool.filter(c => c.area === area).map(c => c.name))];
+  const inCity = [...new Set(pool.map(c => c.name))];
+  const n = Math.min(inCity.length, pick([2, 3]));
+  const names = [];
+  while (names.length < n) {
+    let c = inArea.filter(x => !names.includes(x)); if (!c.length) c = inCity.filter(x => !names.includes(x));
+    if (!c.length) break;
+    names.push(pickLeast(c, 'clinic', t, used));
+  }
+  return {area, names};
+}
+
+function roll(t, used) {
+  const r = {tab: t};
+  const fObj = fixed('f-obj', t), fPain = fixed('f-pain', t), fScene = fixed('f-scene', t);
+  let fGroup = fixed('f-group', t);
+  if (!fGroup && fObj && fObj !== '__none') fGroup = groupOfObj(fObj, t);
+  const painGroups = fPain ? groupOfPain(fPain, t) : null;
+  const gs = groupsOf(t);
+
+  // 1 情境（只抽有至少一個品類能配的）
+  let sPool = scenesOf(t).filter(s => sceneOk(s, fGroup));
+  if (painGroups && painGroups.length) { const f = sPool.filter(s => painGroups.some(g => sceneOk(s, g))); if (f.length) sPool = f }
+  if (gs.length) { const f = sPool.filter(s => gs.some(g => sceneOk(s, g))); if (f.length) sPool = f }
+  if (!sPool.length) sPool = scenesOf(t);
+  sPool = seasonPool(sPool, s => s.name + s.desc);
+  if (t !== '醫美診所' && !fScene && Math.random() < .85) { const f = sPool.filter(s => !isAsk(s)); if (f.length) sPool = f }
+  if (fScene) r.scene = DATA.scene.find(s => s.name === fScene);
+  else {
+    // 心得情境合起來只算 SHARE_SLOTS 個情境的份量；抽中心得時先依結論比例決定結論
+    let pool = sPool;
+    const shares = sPool.filter(s => s.share), plain = sPool.filter(s => !s.share);
+    if (shares.length && plain.length) { const k = Math.min(SHARE_SLOTS, shares.length); pool = Math.random() < k / (plain.length + k) ? shares : plain }
+    if (pool.length && pool.every(s => s.share)) {
+      const moods = [...new Set(pool.map(s => s.mood || ''))];
+      const m = wpick(moods, x => MOOD_W[x] || 20);
+      pool = pool.filter(s => (s.mood || '') === m);
+    }
+    const nm = pickLeast(pool.map(s => s.name), 'scene', t, used); r.scene = pool.find(s => s.name === nm);
+  }
+  used.add('scene', t, r.scene.name, 5);
+
+  // 2 品類（依籤數，避開最近用過；抽中機率＝自己的籤數 ÷ 同分頁可選品類的籤數加總）
+  const weightOf = g => { const G = DATA.groups[g]; const w = t === '空包彈' && G.emptyWeight != null ? G.emptyWeight : G.weight; return w == null ? 2 : w };
+  const pickGroup = cand => { const gmin = Math.min(...cand.map(g => used.n('group', t, g))); const fresh = cand.filter(g => used.n('group', t, g) <= gmin + 1); const p = fresh.length ? fresh : cand; return p.some(g => weightOf(g) > 0) ? wpick(p, weightOf) : pick(p) };
+  if (fGroup) r.group = fGroup;
+  else if (gs.length) {
+    let cand = gs.filter(g => sceneOk(r.scene, g));
+    if (painGroups && painGroups.length) cand = cand.filter(g => painGroups.includes(g));
+    if (!cand.length) cand = gs;
+    r.group = pickGroup(cand);
+  } else if (Math.random() < (REAL_GROUP_RATE[t] || 0)) {
+    // 閒聊、診所分頁：有時從情境列出的品類抽一個，讓指令指定療程
+    const cand = (r.scene.only || Object.keys(DATA.groups)).filter(g => DATA.groups[g] && sceneOk(r.scene, g));
+    r.group = cand.length ? pickGroup(cand) : null;
+  } else r.group = null;
+  if (r.group) used.add('group', t, r.group, 5);
+  const G = r.group ? DATA.groups[r.group] : null;
+
+  // 3 困擾（先決定困擾）
+  const fallbackPain = DATA.tabPain[t] && DATA.tabPain[t].length ? DATA.tabPain[t] : ['容貌焦慮'];
+  if (fPain) r.pain = fPain;
+  else if (t === '醫美診所') {
+    // 抱怨、經驗類情境才配事件型困擾；討論、求推薦類改抽非事件型的
+    let pp = seasonPool(fallbackPain);
+    if (!EVENT_OK_SCENES.includes(r.scene.name)) { const f = pp.filter(p => !EVENT_PAIN_RE.test(p)); if (f.length) pp = f }
+    r.pain = pickLeast(pp, 'pain', t, used);
+  }
+  else if (G) {
+    let pp = G.pains.length ? G.pains : fallbackPain;
+    if (fObj && fObj !== '__none' && G.objInfo[fObj] && G.objInfo[fObj].only) { const f = pp.filter(x => objFits(r.group, fObj, x)); if (f.length) pp = f }
+    r.pain = pickLeast(seasonPool(pp), 'pain', t, used);
+  } else r.pain = pickLeast(seasonPool(fallbackPain), 'pain', t, used);
+  used.add('pain', t, r.pain, 5);
+  // 困擾的角色：抱怨類情境配事件型困擾＝主要內容、要講經過；診所分頁其他情境＝可帶可不帶的一句起因
+  r.eventPain = EVENT_PAIN_RE.test(r.pain) && EVENT_OK_SCENES.includes(r.scene.name);
+  r.painAsCause = t === '醫美診所' && !EVENT_OK_SCENES.includes(r.scene.name);
+  // 4 療程：先決定是不是通稱文（只講療程、不講品牌），再只挑適合這個困擾的
+  r.generic = false; r.gmode = null; r.multi = null; r.items = null; r.cBrands = []; r.gdir = null;
+  if (fObj === '__none') r.obj = null;
+  else if (fObj) r.obj = fObj;
+  else if (G) {
+    const gen = G.generic.filter(o => objFits(r.group, o, r.pain));
+    if (gen.length && Math.random() < (GEN_RATE[t] ?? .4)) { r.generic = true; r.obj = pickLeast(gen, 'obj', t, used); r.gmode = wpick(['A', 'B', 'C'], k => GEN_TYPE_W[k] || 0) }
+    else { const fit = G.objs.filter(o => objFits(r.group, o, r.pain)); r.obj = !fit.length ? null : pickLeast(fit, 'obj', t, used) }
+  } else r.obj = null;
+  if (r.obj) used.add('obj', t, r.obj, 5);
+  r.nick = r.obj && G && G.objInfo[r.obj] ? G.objInfo[r.obj].nick : [];
+
+  // 5 發文者
+  const femaleNeeded = FEMALE_RE.test(r.pain) || FEMALE_RE.test(r.scene.name) || FEMALE_RE.test(r.scene.desc) || /私密|胸/.test(r.group || '');
+  const gv = $('f-gender').value;
+  r.gender = gv !== R ? gv : (femaleNeeded && Math.random() < .85 ? '女' : pick(P.gender));
+  const wv = $('f-who').value;
+  r.who = wv !== R ? wv : (r.gender === '男' && femaleNeeded ? pick(['幫伴侶問', '幫媽媽問']) : (Math.random() < .07 ? pick(P.who.filter(x => x !== '自己')) : '自己'));
+  r.conflict = r.gender === '男' && femaleNeeded && r.who === '自己';
+  r.exp = $('f-exp').value !== R ? $('f-exp').value : pick(P.exp);
+  r.budget = $('f-budget').value !== R ? $('f-budget').value : (G && G.surgery ? pick(P.budget.filter(b => b !== '一萬以內')) : pick(P.budget));
+  let trigPool = TRIGGERS.filter(x => !x.m.length || x.m.includes(MONTH)).map(x => x.text);
+  if (!trigPool.length) trigPool = P.trigger;
+  trigPool = seasonPool(trigPool);
+  r.trigger = $('f-trigger').value !== R ? $('f-trigger').value : pickLeast(trigPool, 'trigger', t, used); used.add('trigger', t, r.trigger, 5);
+
+  // 6 標籤與心得判定
+  const tv = fixed('f-tag', t);
+  r.tag = tv || (r.scene.share ? '心得' : isAsk(r.scene) ? pick(['問題', '詢問']) : t === '閒聊趣味' ? pick(['閒聊', '閒聊', '閒聊', '討論']) : wpick(['閒聊', '討論', '問題', '詢問'], x => ({'閒聊': 30, '討論': 35, '問題': 18, '詢問': 17})[x]));
+  r.share = !!r.scene.share || r.tag === '心得';
+  if (r.share && r.gmode === 'C') r.gmode = 'B';
+  // 6b 多療程：AB 比較／多療程詢問／多療程評估；心得「比較」寫兩種
+  r.fear = /恐懼/.test(r.scene.name) || /^(擔心|怕)/.test(r.scene.dir);
+  r.multiFromScene = false;
+  if (G && !fObj) {
+    let type = null;
+    if (r.share) { if (r.scene.mood === '比較') { type = '比較'; r.multiFromScene = true } }
+    else if (/AB|選擇障礙|對決/.test(r.scene.name)) { type = /^選擇障礙|終極|對決/.test(r.scene.name) ? '評估' : 'AB'; r.multiFromScene = true }
+    else if (t !== '醫美診所' && !r.fear && !/替代|天人交戰|動刀|門檻|長痛短痛/.test(r.scene.name) && !clinicFocus(r) && Math.random() < MULTI_RATE) type = wpick(['AB', '詢問', '評估'], k => MULTI_TYPE_W[k] || 0);
+    if (type) { const m = multiItems(type, r, t, used); if (m) { r.multi = m.type; r.items = m.items; r.obj = m.items.map(i => i.n).join(' 與 '); m.items.forEach(i => used.add('obj', t, i.n, 5)) } }
+  }
+
+  // 7 地區與診所：求推、診所主軸類依比重抽城市，再抽同城市 2–3 間診所（整形手術類只抽整外，部分跨縣市）；
+  //   診所分頁的其他情境一半帶地區，但不提診所名稱
+  const rv = $('f-region').value;
+  const fixedCity = rv !== R && rv !== '__none' ? rv : null;
+  r.region = null; r.clinics = null; r.home = null; r.cross = false; r.bodyClinics = []; r.negClinic = false; r.cClinics = [];
+  r.clinicAxis = isClinicAxis(r.scene);
+  const cities = regionCities();
+  if (rv !== '__none' && !r.share && cities.length) {
+    const surg = !!(G && G.surgery);
+    if (r.clinicAxis && CLINICS.length) {
+      r.home = fixedCity || pickCity(cities);
+      let target = r.home;
+      if (surg && Math.random() < CROSS_RATE) {
+        const surgCities = [...new Set(CLINICS.filter(c => c.surg).map(c => c.city))].filter(c => cities.includes(c));
+        const o = pickCity(surgCities, r.home); if (o) { target = o; r.cross = true }
+      }
+      const pc = pickClinics(target, surg, t, used);
+      if (pc) {
+        r.region = placeName(target, pc.area); r.clinics = pc.names; pc.names.forEach(n => used.add('clinic', t, n, 5));
+        r.negClinic = NEG_CLINIC_SCENES.includes(r.scene.name) || NEG_PAIN_RE.test(r.pain);
+        if (!r.negClinic) r.bodyClinics = r.clinics.slice(0, wpick([0, 1, 2], x => ({0: 30, 1: 35, 2: 35})[x]));
+      } else r.cross = false;
+    } else if (r.clinicAxis || t === '醫美診所') {
+      if ((isAsk(r.scene) && /地區/.test(r.scene.name)) || Math.random() < .5) {
+        const c = fixedCity || pickCity(cities);
+        const areas = CLINICS.length ? CLINICS.filter(x => x.city === c).map(x => x.area) : CITY_FALLBACK[c];
+        r.region = placeName(c, pick(areas));
+      }
+    }
+  }
+
+  // 8 寫法（依真實板友文）
+  const treat = !!(r.obj || G);
+  // 語氣：依心得、類別排除不搭的
+  let tonePool = P.tone;
+  if (r.share) tonePool = tonePool.filter(x => !(TONE_INFO[x] && TONE_INFO[x].notShare));
+  if (t === '閒聊趣味' || t === '醫美診所' || !treat) tonePool = tonePool.filter(x => !(TONE_INFO[x] && TONE_INFO[x].notCC));
+  if (!tonePool.length) tonePool = P.tone;
+  r.tone = $('f-tone').value !== R ? $('f-tone').value : pickLeast(tonePool, 'tone', t, used);
+  const novice = /沒做過|只做過|只在美容院/.test(r.exp), veteran = /老手|固定/.test(r.exp);
+  if ($('f-tone').value === R && ((novice && /老手/.test(r.tone)) || (veteran && /新手/.test(r.tone)))) { const f = tonePool.filter(x => !/老手|新手/.test(x)); r.tone = pick(f.length ? f : tonePool) }
+  used.add('tone', t, r.tone, 5);
+  r.open = ''; r.layout = '';
+  // 字數：一般 75% 為 35–90、25% 為 90–130；心得 70% 為 150–260、30% 為 260–360
+  const lv = $('f-len').value; let lo, hi;
+  if (lv !== R) { const m = lv.match(/(\d+)–(\d+)/); lo = +m[1]; hi = +m[2] }
+  else if (r.share) { [lo, hi] = Math.random() < .7 ? [150, 260] : [260, 360] }
+  else if (r.eventPain) { [lo, hi] = [90, 130] }  // 要講一段經過，至少 90 字
+  else { [lo, hi] = Math.random() < .75 ? [35, 90] : [90, 130] }
+  r.len = Math.round((lo + Math.random() * (hi - lo)) / 5) * 5;
+  r.lines = Math.max(2, Math.min(r.share ? 18 : 9, Math.round(r.len / (r.share ? 18 : 14))));
+  r.blank = r.share ? Math.random() < .75 : Math.random() < .5;
+  r.askEnd = !r.share && (isAsk(r.scene) || Math.random() < (r.tag === '閒聊' ? .3 : .5));
+  // 情境要互動、要推薦、要大家討論的：結尾一定要問，標籤不用閒聊
+  r.mustAsk = !r.share && ASK_SCENE_RE.test(r.scene.desc + r.scene.dir);
+  if (r.mustAsk) { r.askEnd = true; if (!tv && r.tag === '閒聊') r.tag = '討論' }
+  r.push = t !== '空包彈';
+  if (r.gmode === 'C') r.askEnd = true;
+  if (r.multi && !r.share && r.multi !== '比較' && !r.askEnd && Math.random() < .5) r.askEnd = true;
+  r.lenMin = r.share ? Math.max(150, Math.round((r.len - 30) / 10) * 10) : 0;
+  if (r.generic && !r.share && !r.multi && GDIR.length) { const sc2 = r.scene.name + r.scene.dir + r.scene.desc; const m = GDIR.filter(x => x.re && x.re.test(sc2)); r.gdir = pick(m.length ? m : GDIR).d }
+  // 心得內容
+  if (r.share) {
+    r.mood = r.scene.mood || wpick(['滿意', '普通', '後悔'], k => ({滿意: 45, 普通: 35, 後悔: 20})[k]);
+    const items = [['做了什麼、在什麼時候做的', 100], ['花了多少錢，或打了幾發、幾劑、幾cc', 80], ['效果跟做之前比起來的差別', 65], ['一個不滿意的地方或但書', 65], ['做的時候的痛感', 58], ['恢復期的狀況', 32], ['之後會不會再做', 20]];
+    // 至少 4 點，避免心得文寫太短
+    let rest = items.slice(1).filter(x => Math.random() * 100 < x[1]);
+    if (rest.length < 3) rest = [...rest, ...items.slice(1).filter(x => !rest.includes(x))].slice(0, 3);
+    r.shareItems = [items[0][0], ...rest.map(x => x[0])].slice(0, 5);
+  }
+  // 除了主題，最多再帶一件自己的事；起因只在跟方向有關時才帶
+  const sc = r.scene.name + r.scene.desc;
+  const TRIG_OK = /重要場合|容貌焦慮|上妝|起效|心得|術後紀錄|分享|預算|CP/.test(sc) || r.share;
+  const extras = [];
+  if (r.region) r.extra = {k: 'region'};
+  else if (r.share) r.extra = null;
+  else {
+    if (/預算|CP|價格|發數|花費|投資|便宜|貴/.test(sc + r.pain)) extras.push({k: 'budget', v: r.budget});
+    if (/失敗|重修|跨越|術後|複合|頻率|維持|狀態確認|起效/.test(sc)) extras.push({k: 'exp', v: r.exp});
+    if ($('f-trigger').value !== R || TRIG_OK) extras.push({k: 'trigger', v: r.trigger});
+    r.extra = extras.length && Math.random() < .5 ? pick(extras) : null;
+  }
+  if (r.multi === '評估' && !r.region) r.extra = {k: 'budget', v: r.budget};
+  r.helping = r.who !== '自己';
+  if (r.helping && r.extra && (r.extra.k === 'exp' || r.extra.k === 'budget')) r.extra = null;
+  r.priceInBody = r.share || (r.extra && r.extra.k === 'budget') || /價格|預算|CP|發數|花費|便宜|貴/.test(r.scene.name + plainDesc(r.scene.desc) + r.pain);
+  // 推文配比：固定 10 則，噓 0–2、中立 0–2
+  r.cTotal = 10;
+  if ($('f-pushrand').checked) { r.cBoo = pick([0, 0, 1, 1, 1, 2]); r.cNeu = pick([0, 1, 1, 2]) }
+  else { r.cBoo = Math.min(4, Math.max(0, +$('f-b').value || 0)); r.cNeu = Math.min(4, Math.max(0, +$('f-n').value || 0)) }
+  r.cPush = 10 - r.cBoo - r.cNeu; { const x = Math.random(); r.wave1 = x < .4 ? 5 : x < .8 ? 6 : x < .92 ? 7 : 4 }
+  // 標題風格
+  const vsScene = /AB|比較|選擇|vs|對決/.test(r.scene.name + r.scene.dir) || r.multi === 'AB' || r.multi === '比較';
+  if (r.share) r.titleStyle = r.mood === '比較' ? 'compare' : wpick(['result', 'feel', 'what'], k => ({result: 45, feel: 35, what: 20})[k]);
+  else if (isAsk(r.scene)) r.titleStyle = 'ask';
+  else r.titleStyle = wpick(['ask', 'state', 'feel', 'name', 'vs'], k => ({ask: r.askEnd ? 45 : 8, state: 30, feel: r.tag === '閒聊' ? 25 : 12, name: r.obj && !r.generic && !r.multi ? 10 : 0, vs: vsScene ? 25 : 0})[k]);
+  // 標題是問句、擔心類、跟姊妹一起考慮：結尾一定要問，避免整篇只在抱怨
+  if (!r.share && (r.titleStyle === 'ask' || r.fear || r.who === '跟姊妹一起考慮')) r.askEnd = true;
+  r.title = r.titleStyle; used.add('title', t, r.title, 5);
+  // 標題長度：依過往標題分布（不含標籤）
+  r.tLen = r.titleStyle === 'name' ? [3, 8] : wpick([[5, 8], [9, 12], [13, 16], [17, 19]], x => ({5: 11, 9: 33, 13: 36, 17: 20})[x[0]]);
+  // 短文（90 字以下）標題最多 14 字，避免標題寫一個版本、正文又寫一個版本
+  if (!r.share && r.len <= 90 && r.titleStyle !== 'name') r.tLen = wpick([[5, 8], [9, 12], [11, 14]], x => ({5: 15, 9: 45, 11: 40})[x[0]]);
+  r.avoidPhr = sample(TEAM_PHRASES, 3);
+  r.noOpenWord = Math.random() < .7;
+  r.thanks = r.askEnd && Math.random() < .15;
+  r.paren = false;
+  r.emo = Math.random() < .35 ? pick(['XD', '@@', 'QQ', '==', '><']) : null;
+  r.dots = Math.random() < .3;
+  r.punct = wpick(['space', 'line', 'full', 'fullspace', 'half'], k => ({space: 33, line: 26, full: 24, fullspace: 12, half: 5})[k]);
+  if (r.share && r.punct === 'line' && Math.random() < .6) r.punct = 'full';
+  r.qmark = r.punct === 'half' ? '?' : (r.punct === 'full' || r.punct === 'fullspace') ? (Math.random() < .5 ? '？' : '?') : '?';
+  r.titleRepeat = Math.random() < .4;
+  { const x = Math.random(); r.pMax = x < .5 ? 0 : x < .85 ? 1 : 2 }
+  r.cAsk = Math.random() < (r.share ? .2 : .3);
+  // 推文逐則安排：比例依過往推文（多數是附和、經驗、小建議；唱反調很少）
+  {
+    const ST = [
+      {k: 'pos', w: 18, d: r.share ? '講自己做過同一個療程，感覺跟發文者差不多或不太一樣' : '講自己或身邊的人做過的一個具體感受，不一定要跟發文者擔心的事有關'},
+      {k: 'tip', w: 15, d: '補一個跟主題有關、正確的小知識或注意事項'},
+      {k: 'short', w: 12, d: '很短地講一個自己的結論'},
+      {k: 'follow', w: 10, d: '接前一則推文的話，補一句自己的看法'},
+      {k: 'want', w: 8, d: r.share ? '說自己也想做，講出看完這篇在意的點' : '說自己也在考慮，講出自己在意的點'},
+      {k: 'heard', w: 7, d: '講在網路上或聽別人說過的說法'},
+      {k: 'side', w: 5, d: treat ? '聊同一個療程的其他事，例如恢復期、多久做一次' : '聊跟主文同一件事的另一面'},
+      {k: 'pickside', w: r.multi && r.multi !== '詢問' ? 14 : 0, d: '選其中一個，講一句理由'},
+      {k: 'both', w: r.multi ? 8 : 0, d: r.items && r.items.length > 2 ? '說自己做過其中兩個，講感覺上的差別' : '說自己兩個都做過，講感覺上的差別'},
+      {k: 'order', w: r.multi === '詢問' ? 12 : 0, d: '講自己是怎麼安排先後或間隔的'},
+      {k: 'alt', w: treat && !r.multi ? 7 : 0, d: '提一個也能處理這個困擾、而且合理的其他療程'},
+      {k: 'price', w: r.priceInBody ? 5 : 0, d: '講一個自己的價格、堂數或發數，跟主文比較'},
+      {k: 'joke', w: 4, d: '開個小玩笑或吐槽一下'},
+      {k: 'neg', w: 4, d: '講自己或身邊的人做過，有一個不滿意的地方'},
+      {k: 'contra', w: 3, d: '不同意主文或前面某則推文的看法，講出理由'},
+      {k: 'doubt', w: treat ? 3 : 0, d: '懷疑這個療程或某個說法到底有沒有用'},
+    ].filter(s => s.w > 0);
+    const BOO = ['neg', 'contra', 'doubt', 'joke'], NEGK = ['neg', 'contra', 'doubt'];
+    const slots = [...Array(r.cBoo).fill('噓|'), ...Array(r.cNeu).fill('→|'), ...Array(r.cPush).fill('推|')];
+    for (let i = slots.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [slots[i], slots[j]] = [slots[j], slots[i]] }
+    const cnt = {}; let prev = '', negPush = 0; const askAt = r.cAsk ? rint(2, 9) : -1;
+    r.cPlan = slots.map((pf, i) => {
+      if (i === askAt && pf !== '噓|') { prev = 'ask'; return {pf, d: r.share ? '問發文者一個做的細節，用問句' : '問一個具體細節，用問句'} }
+      const cap = k => ['side', 'joke', 'follow', 'short', 'heard', 'price', 'tip', 'both', 'order'].includes(k) ? 1 : 2;
+      let pool = ST.filter(s => (cnt[s.k] || 0) < cap(s.k) && s.k !== prev && (i > 0 || s.k !== 'follow'));
+      if (pf === '噓|') { pool = pool.filter(s => BOO.includes(s.k)); if (!pool.length) pool = ST.filter(s => BOO.includes(s.k)) }
+      else { if (negPush >= 1) pool = pool.filter(s => !NEGK.includes(s.k)) }
+      if (pf === '→|') pool = pool.filter(s => ['tip', 'side', 'heard', 'price', 'short'].includes(s.k));
+      if (!pool.length) pool = ST.filter(s => !NEGK.includes(s.k) && s.k !== 'follow');
+      const s = wpick(pool, x => x.w); cnt[s.k] = (cnt[s.k] || 0) + 1; prev = s.k; if (pf !== '噓|' && NEGK.includes(s.k)) negPush++; return {pf, d: s.d};
+    });
+    // 通稱文 B／C：推文裡安排幾則講自己做的牌子（牌子由程式抽，第 2 則以後）
+    if (!r.push && r.gmode === 'B') r.gmode = 'A';
+    if (r.push && (r.gmode === 'B' || r.gmode === 'C')) {
+      const gsrc = r.items ? [...new Set(r.items.map(i => i.g))] : [r.group];
+      const pool = [...new Set(gsrc.flatMap(g => (DATA.groups[g] ? DATA.groups[g].objs : []).filter(o => objFits(g, o, r.pain) || g !== r.group)))].filter(o => !GEN_SET.has(o));
+      const n = Math.min(pool.length, r.gmode === 'B' ? pick([1, 2]) : pick([2, 3]));
+      const bslots = r.cPlan.map((c, i) => i).filter(i => i >= 1 && r.cPlan[i].pf === '推|' && !/問句/.test(r.cPlan[i].d));
+      const at = sample(bslots, Math.min(n, bslots.length)).sort((a, b) => a - b);
+      const bs = []; at.forEach(() => { const c = pool.filter(o => !bs.includes(o)); if (c.length) { const b = pickLeast(c, 'obj', t, used); bs.push(b); used.add('obj', t, b, 5) } });
+      at.forEach((i, k) => {
+        if (!bs[k]) return; const last = r.gmode === 'C' && k === bs.length - 1 && bs.length > 1;
+        r.cPlan[i] = {pf: '推|', d: last ? `講自己做的是「${bs[k]}」，覺得普通或有一個小地方不滿意` : `講自己做的是「${bs[k]}」，一句帶過感覺，不要像在推銷`};
+      });
+      r.cBrands = bs.slice(0, at.length);
+      if (!r.cBrands.length) r.gmode = 'A';
+    }
+    // 求推、診所主軸：安排 1–3 則推文推薦或分享診所（只用推薦或中性說法，不寫負評）
+    if (r.push && r.clinics && r.clinics.length) {
+      const k = Math.min(r.clinics.length, wpick([1, 2, 3], x => ({1: 30, 2: 45, 3: 25})[x]));
+      const free = r.cPlan.map((c, i) => i).filter(i => i >= 1 && r.cPlan[i].pf === '推|' && !/問句|講自己做的是/.test(r.cPlan[i].d));
+      const at = sample(free, Math.min(k, free.length)).sort((a, b) => a - b);
+      const names = sample(r.clinics, at.length);
+      at.forEach((i, j) => { r.cPlan[i] = {pf: '推|', d: pick([`推薦「${names[j]}」，講一個具體的好處，一句帶過，不要像業配`, `說自己在「${names[j]}」做過，感覺還可以，講一個小細節`, `說朋友在「${names[j]}」做過，評價不錯，一句帶過`])} });
+      r.cClinics = names;
+    }
+  }
+  // 範例：同品類、同標籤、字數相近，且跟這篇的寫法規則不衝突
+  r.examples = pickExamples(r, usedEx);
+  return r;
+}
+
+/* ================= 組指令 ================= */
+function clinicFocus(r) { return r.tab === '醫美診所' || r.scene.type === '求推' || r.scene.type === '診所主軸' }
+function stripClinicAsk(d) {
+  const parts = d.split(/(?<=[，。；？?！!])/);
+  const bad = /(求推|推薦|名單|找).{0,20}(診所|醫師|醫生)|(診所|醫師|醫生).{0,8}(推薦|求推)|安心診所|挑選醫生|挑醫生|的醫師|的診所/;
+  const kept = parts.filter(s => !bad.test(s));
+  return (kept.join('').replace(/[，、；]$/, '。') || d);
+}
+const VIVID = /阿凡達|毛毛蟲|石頭奶|釋迦|充氣娃娃|饅化臉|烙鐵|陰影面積|求生欲|社死|打水漂|心酸|血淚|推坑|生火|滅火|眉毛壓眼|皮笑肉不笑|菜市場|呼吸困難|滿心期待|驚豔|連根拔起/;
+function stripVivid(d) { return d.split(/(?<=[、，。；])/).filter(s => !VIVID.test(s)).join('').replace(/[、，]$/, '。').replace(/[、，]([。；])/g, '$1') || d }
+function plainDesc(d) {
+  d = stripVivid(d);
+  return d.replace(/⚠️/g, '').replace(/[（(][^）)]{0,80}[）)]/g, '').replace(/(例如|如：|舉例如|舉例可描述|可直接舉例)[^。；？?]*[。；]?/g, '').replace(/【([^】]*)】/g, '$1').replace(/「([^」]*)」/g, '$1').replace(/\s{2,}/g, ' ').trim();
+}
+function promptText(r) {
+  const ban = [...new Set([...SHEET_BAN, ...$('f-ban').value.split(/[,，、\n]/).map(s => s.trim()).filter(Boolean)])];
+  const avoid = $('f-avoid').value.split('\n').map(s => s.trim()).filter(Boolean);
+  const kw = $('f-kw').value.split(/[,，、\n]/).map(s => s.trim()).filter(Boolean);
+  const note = $('f-note').value.trim();
+  const push = r.push && r.cTotal > 0;
+  const G = r.group;
+  const L = [];
+  L.push(`你是台灣 PTT 醫美板 facelift 的板友，照下面的主題發一篇文${push ? '，再寫底下的推文' : ''}。`);
+  L.push('整篇放在一個 ``` 程式碼區塊裡輸出，保留所有換行和空行，區塊外不要加任何說明。');
+  L.push('這篇和這個對話裡之前寫過的任何文章都無關：不要沿用前面文章的開頭、標記、格式、句型或推文寫法。');
+  L.push('');
+  L.push('【主題】');
+  // 品類用「指令裡的名稱」；療程跟品類同名或是通稱文時不寫品類那一行
+  const nkText = items => items.filter(i => !r.generic).map(i => [i.n, nickOf(i.g, i.n).filter(x => !/^[\x00-\x7f]+$/.test(x)).slice(0, 2)]).filter(x => x[1].length).map(([n, k]) => `${n}板上也常叫${k.join('、')}`);
+  const genLine = r.gmode === 'A' ? '正文和推文都只用通稱，不要提任何品牌或儀器名稱' : '正文只用通稱，不要提品牌或儀器名稱';
+  if (r.multi) {
+    const names = r.items.map(i => i.n); const nk = nkText(r.items);
+    L.push(`療程：${names.join('、')}${nk.length ? '；' + nk.join('；') : ''}`);
+    const gset = [...new Set(r.items.map(i => i.g))];
+    if (!r.generic) {
+      if (gset.length === 1) { if (!names.every(n => n.includes(gShow(gset[0])))) L.push(`${names.length > 2 ? '這幾個' : '兩個'}都是${gShow(gset[0])}`) }
+      else { const kinds = r.items.filter(i => !GEN_SET.has(i.n) && !gShow(i.g).includes(i.n) && !i.n.includes(gShow(i.g))).map(i => `${i.n}是${gShow(i.g)}`); if (kinds.length) L.push(`這幾個分別是：${kinds.join('，')}`) }
+    } else L.push(genLine);
+  } else if (r.obj) {
+    const same = G && (gShow(G).includes(r.obj) || r.obj.includes(gShow(G)));
+    if (G && !r.generic && !same) L.push(`品類：${gShow(G)}`);
+    const nk = nkText([{n: r.obj, g: G}]);
+    L.push(`療程：${r.obj}${nk.length ? '；' + nk.join('；') : ''}${r.generic ? '。' + genLine : ''}`);
+  }
+  else if (r.tab === '醫美診所') L.push('療程：不提具體療程，聊診所本身');
+  else if (G) L.push(`療程：用「${(DATA.groups[G].generic[0]) || gShow(G)}」這個通稱就好，不要自己編療程或儀器名稱`);
+  const showPain = !(r.tab === '閒聊趣味' && !G) && !(r.fear && !r.share);
+  if (r.share) L.push(`做這個療程的原因：${r.pain}，用一般人的講法帶過`);
+  else if (showPain && r.painAsCause) L.push(`可以用一句帶到自己遇過的事：${r.pain}；不帶也可以，整篇重點放在下面的方向`);
+  else if (showPain && r.eventPain) L.push(`困擾：${r.pain}。這是自己遇到的一次經過，用兩三句講清楚：什麼時候、發生什麼事、自己怎麼反應`);
+  else if (showPain) L.push(`困擾：${r.pain}。用一般人的講法描述；它是這個方向裡的具體例子，不是另一個題目`);
+  if (r.share) {
+    const M = {滿意: '整體滿意，但不是全部都好', 普通: '效果普通，有好有壞，說不上值不值得', 後悔: '不太滿意，有點後悔，但不是在罵', 紀錄: '照時間順序記錄做完到現在的狀況，不下定論', 比較: r.multi ? `自己做過${r.items.map(i => i.n).join('跟')}，比較兩者的差別` : '自己做過兩種，比較兩者的差別'};
+    L.push(`這是一篇心得文。${r.mood === '比較' || r.mood === '紀錄' ? '寫法' : '心得結論'}：${M[r.mood]}`);
+    L.push(`要寫到這幾點：${r.shareItems.join('；')}`);
+  } else {
+    const names = r.items ? r.items.map(i => i.n) : [];
+    const MD = {AB: `${names.join('跟')}二選一：同一個困擾，不知道選哪個，想問做過的人差在哪`, 詢問: `想同時做${names.join('跟')}：問先做哪個、能不能同一天做、會不會互相影響，挑一兩個問就好`, 評估: `預算有限，在${names.join('、')}之間猶豫，${names.length > 2 ? '只能先做一兩個' : '只能先做一個'}，請大家幫忙排先後`};
+    if (r.multi && !r.multiFromScene) L.push(`方向：${MD[r.multi]}`);
+    else {
+      L.push(`方向：${r.scene.dir}。說明：${plainDesc(clinicFocus(r) ? r.scene.desc : stripClinicAsk(r.scene.desc))}`);
+      if (r.multi) L.push(`要比較的就是上面這${names.length > 2 ? '幾' : '兩'}個療程`);
+    }
+    if (r.gdir) L.push(`具體想聊的是${r.gdir}；跟上面的方向講成同一件事`);
+    L.push('說明只是參考，不要照抄用詞，也不要寫得這麼戲劇化；整篇只講這個方向，方向名稱不要直接寫進標題');
+    if (r.fear) L.push('擔心的事用平常的講法講一句就好，不要描述想像出來的畫面，也不要自己造新詞');
+  }
+  if (!clinicFocus(r)) L.push('重點不是找診所：不要問或請大家推薦哪間診所、哪位醫生');
+  if (r.extra) {
+    if (r.extra.k === 'region') {
+      // 要找診所的文才寫「想找這一區」；討論類只在自然時順帶
+      const seek = isAsk(r.scene) || /名單|推薦|求推|徵求/.test(r.scene.desc + r.scene.dir);
+      L.push(r.cross ? `地區：發文者住${r.home}，但想跑到${r.region}找整外，帶一句為什麼願意跑遠`
+        : seek ? `地區：${r.region}，帶一句想找這一區的就好` : `地區：${r.region}，自然的話順帶一句自己在這一區看診所，不自然就不提`);
+    }
+    else if (r.extra.k === 'budget') L.push(`可以帶到一句：預算大概${r.extra.v}`);
+    else if (r.extra.k === 'exp') L.push(`可以帶到一句自己的狀況：${r.extra.v}`);
+    else if (r.extra.k === 'trigger') L.push(`可以帶到一句起因：${r.extra.v}`);
+  }
+  // 診所名稱：只有求推、診所主軸類會出現；抱怨類正文不點名
+  if (r.clinics) {
+    if (r.negClinic) L.push('正文不要寫出任何診所的名字，講到自己去過的地方就用「之前去的那間」這種講法');
+    else if (r.bodyClinics.length) L.push(`正文可以順帶提到${r.bodyClinics.join('、')}，只寫在考慮或聽說過，不要評價好壞`);
+    else L.push('正文不要寫出任何診所的名字');
+    const where = r.bodyClinics.length && r.cClinics.length ? '正文和推文提到的診所' : r.bodyClinics.length ? '正文提到的診所' : r.cClinics.length ? '推文提到的診所' : '';
+    L.push(where ? `${where}照上面寫的名稱，不要自己加分院名稱或改名；整篇都不要提醫師的名字` : '整篇都不要提醫師的名字');
+  } else L.push('正文不要寫出任何診所或醫師的名字');
+  if (kw.length) L.push(`必提關鍵字：${kw.join('、')}，自然放進標題或正文`);
+  if (note) L.push(`補充要求：${note}`);
+  L.push('');
+  L.push('【寫法】照真實板友發文的樣子寫');
+  const TS = {ask: '標題用問句直接問想知道的事', state: '標題用陳述句講自己的狀況或發現，不用問號', feel: '標題用一句感想或吐槽', name: '標題很短，只寫療程名稱或關鍵字', vs: '標題寫成兩個選項的比較', result: '標題直接講做完的結果', what: '標題寫做了什麼跟過了多久', compare: '標題寫兩個療程的比較'};
+  L.push(`標籤用 [${r.tag}]，${TS[r.titleStyle]}；標籤後面的標題 ${r.tLen[0]} 到 ${r.tLen[1]} 個字，英數字算半個字${r.titleRepeat ? '' : '；第一行不要重述標題'}`);
+  if (r.share) L.push(`正文至少 ${r.lenMin} 字，目標約 ${r.len} 字、${r.lines} 行左右，每行 8 到 25 字，一行一句話${r.blank ? '，分成兩三段，段落之間空一行' : '，行跟行之間不空行'}；寫完自己數一次，不到 ${r.lenMin} 字就把過程、數字或感受補具體，不要用廢話湊字`);
+  else L.push(`正文約 ${r.len} 字、${r.lines} 行左右，每行 8 到 25 字，一行一句話${r.blank ? '，中間可以空一行' : '，行跟行之間不空行'}；前後句要接得起來，像一個人在講同一件事`);
+  if (r.share) L.push('心得文要講清楚自己做了什麼、過程跟結果，數字和感受要具體；可以有一句一開始的動機，不要寫成問題文，也不要向大家發問');
+  else if (r.eventPain) L.push(`第一行就進入那次經過${r.noOpenWord ? '，不要用「最近」「如題」開頭' : ''}；除了那段經過和上面「可以帶到一句」的內容，不要交代年齡、職業、預算或其他經歷`);
+  else L.push(`第一行就進入主題，不要鋪陳背景故事${r.noOpenWord ? '，也不要用「最近」「如題」開頭' : ''}；除了上面「可以帶到一句」的內容，不要交代年齡、職業、預算、經歷或發生了什麼事`);
+  if (!r.share && r.gmode === 'C') L.push(`最後一行用自己的話順便問大家都做哪個牌子或哪一台${r.thanks ? '，最後可以補一句謝謝大家' : ''}`);
+  else if (!r.share) L.push(r.askEnd ? `最後一行把想問的事用自己的話丟給大家，不要用「你們覺得呢」「大家怎麼看」這種套話${r.thanks ? '，最後可以補一句謝謝大家' : ''}` : '這篇不用問大家，但要講一件具體的事，例如自己做過的經驗、看到的說法、一個價格或數字、跟別的療程比較；最後用一句自己接下來的打算或還在猶豫的事收掉，不要用大道理或金句總結，也不要整篇只在抱怨或擔心');
+  if (r.helping) L.push(r.who === '跟姊妹一起考慮' ? '這篇是跟姊妹一起考慮：可以提到是兩個人一起在看，但重點放在要問的事' : `這篇是${r.who}：第一行寫「(幫問)」，整篇用幫別人問的角度，講的是對方的狀況`);
+  else L.push('這篇是發文者自己的事，不要寫「(幫問)」「代問」「代PO」');
+  L.push(`語氣：${r.tone}；這只影響講話方式，不要把語氣寫成文章內容`);
+  L.push(`用詞平淡口語，療程用台灣醫美板常見的中文俗稱或簡稱，不用英文原廠全名、學名或中國叫法；不要比喻、誇飾和作文用語；情緒用一句平淡的講就好，不要用氣死、崩潰、傻眼、爛攤子、超扯這種誇張字；少用${r.avoidPhr.join('、')}`);
+  if (r.multi) L.push('只提上面這幾個療程，不要再加其他療程名稱');
+  else L.push(/替代|比較|選擇|AB|vs|CP|複合|侵入|一起做/.test(r.scene.name + r.scene.dir) || r.mood === '比較' ? '可以提到用來比較的其他療程，但只講跟這個困擾有關的' : '不要提到主題以外的療程名稱');
+  const PUNCT = {space: '這篇句子裡不加逗號，要停頓就空一個半形空白', line: '這篇每行都是一個短句，行內不加逗號也不空格，靠換行斷句', full: '這篇用全形「，」「、」斷句，可以有一處「！」', fullspace: '這篇混著用，有些句子用全形「，」斷，有些用半形空白斷', half: '這篇用半形「,」斷句，可以有一處半形「!」'};
+  L.push(`標點：${PUNCT[r.punct]}；句尾不用句號；問號用「${r.qmark}」；${r.dots ? '可以有一處 .. 或 ...' : '不要用 .. 或 ...'}；${r.emo ? `可以用一次「${r.emo}」也可以不用` : '不要用 XD、@@、QQ 這類表情'}；${r.helping ? '除了(幫問)以外不要用括號' : '不要用括號'}`);
+  { const off = SEASON_RULES.filter(x => !x.m.includes(MONTH)).map(x => x.label); L.push(`現在是 ${MONTH} 月，${SEASON_NAME(MONTH)}，開題和推文都不要出現不符時間的事${off.length ? '，例如' + sample(off, Math.min(4, off.length)).join('、') : ''}`) }
+  L.push('療程原理和效果要符合一般醫美常識，不要把不同品類的效果混在一起');
+  L.push('PTT 用繁體 Big5 編碼：標題、正文、推文都不要用 emoji、簡體字或特殊符號，會變成問號');
+  if (ban.length) L.push(`禁用詞：${ban.join('、')}`);
+  if (r.conflict) L.push('困擾偏女性，請寫成幫伴侶或家人問');
+  if (avoid.length) { L.push(''); L.push('【避免重複】最近寫過這些標題，這篇的切角和標題不能跟它們相似：'); avoid.slice(-30).forEach(a => L.push(a)) }
+  L.push('');
+  if (push) {
+    const w2 = r.cTotal - r.wave1;
+    L.push('【推文】');
+    L.push(`剛好 10 則：正文後空一行寫第一批 ${r.wave1} 則，再空一行寫第二批 ${w2} 則，第二批可以比較有資訊；每則獨立一行，不要編號或粗體，寫完自己數一次`);
+    L.push(`照下面的安排寫：「推|」「噓|」照寫${r.cBoo ? '，噓文是不認同發文者的想法或對這個做法有負面看法，語氣可以直但不要人身攻擊' : ''}；「→|」是中立推文，輸出時那一行前面不加任何符號；冒號後面的說明不要寫進推文`);
+    r.cPlan.forEach((c, i) => { if (i === r.wave1) L.push('（這裡空一行，接第二批）'); L.push(`第${i + 1}則 ${c.pf}：${c.d}`) });
+    const rules = [
+      '10 則講的事都要不一樣；直接回應發文者擔心或想問的那件事最多兩則，其他照安排寫',
+      `每則推文就是一行，不要把一則拆成兩行寫；沒有加「推|」「噓|」的行整串剛好 ${r.cNeu} 行`,
+      '推文是一般網友隨手回，不要像診所衛教或業配；講原理的推文整串最多一則，不要用「專業評估」「建議諮詢」這種說法',
+      `講療程效果、其他療程或注意事項要符合一般醫美常識，不確定就講自己的感受；${r.cClinics.length ? '除了安排好提診所的那幾則，其他推文不要提具體診所；提到的診所都不能說壞話；都不要提醫師名字' : '不要提具體診所或醫師名字'}`,
+      `${r.cAsk ? '除了安排好的那一則，其他' : ''}推文不要用問句；不要用「原PO」稱呼發文者；不要用括號；不要寫「+1」「同問」「推推」「卡」「蹲」「想知道」「謝謝分享」「我也是」這種看不出在回什麼的推文`,
+      `每則 30 字以內，${pick(['大部分 8 到 22 字', '長短交錯，有幾則只有幾個字', '多數一行內講完'])}；像隨手打的，句中停頓用空格，幾乎不用而且、但是、不過、所以`,
+      r.pMax === 0 ? '句尾直接結束，整串都不要加啦、喔、欸、耶、吧、XD 這類語助詞' : `大部分句尾直接結束；整串最多 ${r.pMax} 則用語助詞，「啦」只用在把話講淡或安撫人，「吧」只用在猜測`,
+      '「我朋友」「我覺得」「醫生技術」「看醫生」「真的」「其實」整串各最多一次',
+      '推文只根據主文出現過的資訊回應，不要自己補主文沒提到的價格或恢復期',
+    ];
+    if (r.gmode === 'A') rules.push('推文也都不要提任何品牌或儀器名稱');
+    else if (r.gmode === 'B' || r.gmode === 'C') rules.push('除了安排好講自己做哪個牌子的那幾則，其他推文不要提品牌或儀器名稱');
+    L.push(...sample(rules, rules.length));
+  } else L.push('【推文】不要寫推文，正文寫完就結束。');
+  L.push('');
+  L.push('【範例】以下是過往實際發過的文，只學長度、斷行、語氣和推文的感覺，不要抄內容、標題或句子：');
+  r.examples.forEach((x, i) => { L.push(''); L.push(`--- 範例 ${i + 1} ---`); L.push(x) });
+  return L.filter((x, i, a) => x !== '' || a[i - 1] !== '').join('\n');
+}
+
+/* ================= 卡片 ================= */
+let mode = store.get('mode') === 'mix' ? 'mix' : 'single';
+let tab = CATS.includes(store.get('cat')) ? store.get('cat') : '電音波';
+let mix = {...PRESETS.an};
+try { const m = JSON.parse(store.get('mix') || 'null'); if (m) mix = {...mix, ...m} } catch (e) {}
+let cards = []; // {id,uid,tab,r,text,pinned,copiedAt}
+let RECS = []; try { RECS = JSON.parse(store.get('hist') || '[]') } catch (e) { RECS = [] }
+if (!Array.isArray(RECS)) RECS = [];
+let touched = false;
+let windowDays = [7, 14, 30].includes(+store.get('win')) ? +store.get('win') : 14;
+function recentRecs() { const since = Date.now() - windowDays * 864e5; return RECS.filter(x => x.ts >= since) }
+let seq = 0;
+
+function cardRec(c) { const r = c.r; return {tt: r.tone + '/' + r.title, tab: c.tab, scene: r.scene.name, group: r.group || '', obj: r.obj || '', cb: (r.cBrands || []).join(' 與 '), cl: (r.clinics || []).join('、'), pain: r.pain, tone: r.tone, title: r.title, open: r.open, trigger: r.trigger, layout: r.layout, tag: r.tag} }
+function newUsed(except) {
+  const U = mkU(); const now = Date.now();
+  // 多療程、推文裡的牌子逐一算進防撞題
+  const objs = x => [...new Set(((x.obj || '') + ' 與 ' + (x.cb || '')).split(' 與 ').filter(Boolean))].filter(o => o !== x.obj);
+  // 診所逐間算進防撞題（不分分頁）
+  const cls = x => String(x.cl || '').split('、').filter(Boolean);
+  recentRecs().forEach(x => { const age = (now - x.ts) / 864e5; const y = {...x, tt: x.tone + '/' + x.title}; const w = age <= 3 ? 2 : 1; REC_FIELDS.forEach(f => U.add(f, x.tab, y[f], w)); objs(x).forEach(o => U.add('obj', x.tab, o, w)); cls(x).forEach(n => U.add('clinic', x.tab, n, w)) });
+  cards.forEach(c => { if (c === except) return; const x = cardRec(c); REC_FIELDS.forEach(f => U.add(f, x.tab, x[f], 5)); objs(x).forEach(o => U.add('obj', x.tab, o, 5)); cls(x).forEach(n => U.add('clinic', x.tab, n, 5)) });
+  return U;
+}
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+function make(t, used) { const r = roll(t, used); return {id: ++seq, uid: uid(), tab: t, r, text: promptText(r), pinned: false, fresh: true} }
+function plan() {
+  if (mode === 'single') { const n = Math.max(1, Math.min(10, +$('f-count').value || 1)); return Array(n).fill(tab) }
+  const out = []; CATS.forEach(c => { for (let i = 0; i < (+mix[c] || 0); i++) out.push(c) }); return out;
+}
+const todayKey = () => { const d = new Date(); return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate() };
+function saveCards() {
+  const data = JSON.stringify({day: todayKey(), cards: cards.map(c => ({uid: c.uid, tab: c.tab, r: c.r, text: c.text, pinned: c.pinned, copiedAt: c.copiedAt || null}))});
+  if (!store.set('cards', data)) $('cards-msg').textContent = '瀏覽器儲存空間滿了，卡片沒有存起來，重新整理會不見。可以到複製紀錄按「歸零」清掉舊紀錄。';
+  else $('cards-msg').textContent = '';
+}
+function restoreCards() {
+  try {
+    const s = JSON.parse(store.get('cards') || 'null');
+    if (!s || s.day !== todayKey() || !Array.isArray(s.cards) || !s.cards.length) return false;
+    cards = s.cards.map(c => ({...c, id: ++seq, fresh: false})); touched = true; draw(); return true;
+  } catch (e) { return false }
+}
+function fmtTime(ts) { const d = new Date(ts); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') }
+function drawProgress() {
+  const el = $('progress'); if (!cards.length) { el.hidden = true; return }
+  const done = cards.filter(c => c.copiedAt).length, total = cards.length, left = total - done;
+  const start = new Date(); start.setHours(0, 0, 0, 0);
+  const mine = RECS.filter(x => x.ts >= start.getTime()).length;
+  let html = `這批 <b>${done} / ${total}</b> 篇已複製` + (left ? `<span class="left">還有 ${left} 篇沒複製</span>` : '<span class="pc full">這批都複製完了</span>');
+  if (mode === 'mix') { CATS.forEach(c => { const tot = cards.filter(x => x.tab === c).length; if (!tot) return; const d = cards.filter(x => x.tab === c && x.copiedAt).length; html += `<span class="pc${d === tot ? ' full' : ''}">${esc(SHORT[c])} ${d}/${tot}</span>` }) }
+  html += `<span class="hint">今天這台瀏覽器一共複製了 ${mine} 篇${$('f-test').checked ? '（測試模式不計）' : ''}</span>`;
+  el.innerHTML = html; el.hidden = false;
+}
+function generate() {
+  if (!ready) return;
+  touched = true;
+  usedEx.clear();
+  const kept = cards.filter(c => c.pinned || c.copiedAt);
+  cards = [...kept];
+  const want = plan();
+  // 已保留、已複製的卡片抵掉對應類別的名額
+  kept.forEach(p => { const i = want.indexOf(p.tab); if (i > -1) want.splice(i, 1) });
+  const skipped = [...new Set(want.filter(t => !scenesOf(t).length))];
+  const used = newUsed();
+  want.filter(t => scenesOf(t).length).forEach(t => cards.push(make(t, used)));
+  $('cards-note').textContent = skipped.length ? `「${skipped.join('、')}」在 Excel 裡沒有可用的情境，這批沒有產生這些分頁。` : '';
+  draw(); saveCards();
+}
+function regenOne(card) {
+  if (!ready) return;
+  touched = true;
+  // 已複製的卡片重抽＝這篇不用了，從複製紀錄移除，不再影響防撞題
+  if (card.copiedAt && RECS.some(x => x.id === card.uid)) {
+    RECS = RECS.filter(x => x.id !== card.uid); saveRecs(); drawHist(); drawPool();
+  }
+  const used = newUsed(card);
+  const nc = make(card.tab, used);
+  cards[cards.indexOf(card)] = nc; draw(); saveCards();
+}
+function highlight(t) { return esc(t).replace(/^(【[^】]+】)/gm, '<span class="k">$1</span>').replace(/^(推\||噓\|)/gm, '<span class="d">$1</span>') }
+// 卡片第一行：療程｜方向；第二行：困擾、發文者、字數
+function headline(r) {
+  const names = r.items ? r.items.map(i => i.n) : (r.obj ? [r.obj] : []);
+  const sep = r.multi === '詢問' ? '＋' : r.multi === '評估' ? '、' : ' vs ';
+  const what = names.length ? names.join(sep) : (r.group ? gShow(r.group) : '');
+  const dir = String(r.scene.dir || r.scene.name).replace(/^心得文?[_：:]\s*/, '');
+  return what ? `${what}｜${dir}` : dir;
+}
+function subline(r) {
+  const place = r.region ? (r.cross ? `住${r.home}→${r.region}` : r.region) : '';
+  const cl = r.clinics ? '診所：' + r.clinics.join('、') : '';
+  return [r.pain, r.gender + (r.who === '自己' ? '' : ' · ' + r.who), r.share && r.mood ? '心得：' + r.mood : '', '約 ' + r.len + ' 字', place, cl, r.push ? '推文 10 則' : '不寫推文'].filter(Boolean).join(' · ');
+}
+function draw() {
+  const box = $('cards'); box.innerHTML = '';
+  if (!cards.length) { box.innerHTML = `<p class="note">${ready ? '今日配比全部是 0，請至少填一篇。' : '參數池讀進來之後就會產生指令。'}</p>`; drawProgress(); return }
+  // 沒複製的在上面，複製過的沉到「已複製」區；編號維持產生時的順序
+  const order = [...cards.filter(c => !c.copiedAt), ...cards.filter(c => c.copiedAt)];
+  const nDone = cards.filter(c => c.copiedAt).length;
+  order.forEach(c => {
+    const i = cards.indexOf(c);
+    const r = c.r;
+    if (c.copiedAt && c === order.find(x => x.copiedAt)) { const sep = document.createElement('div'); sep.className = 'done-sep'; sep.textContent = `已複製（${nDone}）`; box.appendChild(sep) }
+    const el = document.createElement('article'); el.className = 'card' + (c.pinned ? ' pinned' : '') + (c.copiedAt ? ' done' : '') + (c.fresh ? ' new' : ''); c.fresh = false; el.dataset.cat = c.tab;
+    const badges = [];
+    if (c.copiedAt) badges.push('<span class="chip donechip">✓ 已複製 ' + fmtTime(c.copiedAt) + '</span>');
+    if (r.multi) badges.push('<span class="bd multi">' + {AB: 'AB 比較', 詢問: '多療程詢問', 評估: '多療程評估', 比較: '兩種比較'}[r.multi] + '</span>');
+    if (r.generic) badges.push('<span class="bd gen">' + {A: '通稱', B: '通稱・推文帶牌子', C: '通稱・問牌子'}[r.gmode] + '</span>');
+    const head = document.createElement('div'); head.className = 'card-head';
+    head.innerHTML = '<div class="card-main"><div class="card-title"><span class="no">#' + String(i + 1).padStart(2, '0') + '</span><span class="catname">' + esc(SHORT[c.tab]) + '</span><span class="tagtxt">[' + esc(r.tag) + ']</span><span class="ttl">' + esc(headline(r)) + '</span>' + badges.join('') + '</div><div class="card-sub">' + esc(subline(r)) + '</div></div>';
+    const tools = document.createElement('div'); tools.className = 'card-tools';
+    const msg = document.createElement('span'); msg.className = 'copied';
+    const bPin = document.createElement('button'); bPin.type = 'button'; bPin.className = 'ghost small'; bPin.textContent = c.pinned ? '已保留' : '保留'; bPin.setAttribute('aria-pressed', c.pinned);
+    bPin.onclick = () => { touched = true; c.pinned = !c.pinned; draw(); saveCards() };
+    const bRe = document.createElement('button'); bRe.type = 'button'; bRe.className = 'ghost small'; bRe.textContent = '重抽'; bRe.disabled = c.pinned || !ready;
+    if (c.copiedAt) bRe.title = '重抽後，這篇會從複製紀錄移除';
+    bRe.onclick = () => {
+      // 已複製的卡片要按兩次，避免誤按
+      if (c.copiedAt && bRe.dataset.confirm !== '1') { bRe.dataset.confirm = '1'; bRe.textContent = '確定重抽？'; msg.textContent = '這篇會從紀錄移除'; setTimeout(() => { bRe.dataset.confirm = ''; bRe.textContent = '重抽'; msg.textContent = '' }, 3000); return }
+      regenOne(c);
+    };
+    const bCp = document.createElement('button'); bCp.type = 'button'; bCp.className = c.copiedAt ? 'ghost small' : 'copy-main'; bCp.textContent = c.copiedAt ? '再複製' : '複製指令';
+    bCp.onclick = () => copy(c, msg, el);
+    tools.append(msg, bPin, bRe, bCp); head.appendChild(tools);
+    const det = document.createElement('details'); det.className = 'prompt'; if (c.open) det.open = true; det.ontoggle = () => { c.open = det.open };
+    const sm = document.createElement('summary'); sm.textContent = '查看指令內容';
+    const pre = document.createElement('pre'); pre.className = 'term'; pre.innerHTML = highlight(c.text);
+    det.append(sm, pre); el.append(head, det); box.appendChild(el);
+  });
+  drawProgress();
+}
+function copy(c, msg, el) {
+  const markDone = () => { if (!c.copiedAt) c.copiedAt = Date.now(); log(c); saveCards() };
+  const ok = () => { msg.textContent = '已複製'; markDone(); setTimeout(draw, 700) };
+  const fb = () => {
+    const dd = el.querySelector('details'); if (dd) dd.open = true;
+    const pre = el.querySelector('pre'); const rg = document.createRange(); rg.selectNodeContents(pre); const s = getSelection(); s.removeAllRanges(); s.addRange(rg);
+    msg.textContent = '已選取，請按 Ctrl/⌘+C'; markDone();
+  };
+  try { navigator.clipboard.writeText(c.text).then(ok, fb) } catch (e) { fb() }
+}
+
+/* ================= 紀錄（只存在這台瀏覽器） ================= */
+function saveRecs() { if (!store.set('hist', JSON.stringify(RECS))) { RECS = RECS.slice(0, 150); store.set('hist', JSON.stringify(RECS)) } }
+function log(c) {
+  touched = true;
+  if ($('f-test').checked) return;
+  if (RECS.some(x => x.id === c.uid)) return; // 同一張卡再複製不重複記
+  const r = c.r;
+  const rec = {id: c.uid, ...cardRec(c), ts: Date.now(), sum: [SHORT[c.tab], '[' + r.tag + ']', r.scene.name, r.obj || r.group || '', r.pain].filter(Boolean).join(' / '), text: c.text};
+  RECS.unshift(rec); RECS = RECS.slice(0, 300);
+  saveRecs(); drawHist(); drawPool(); drawProgress();
+}
+function drawHist() {
+  const items = RECS.slice(0, 120);
+  $('hist-title').textContent = `複製紀錄（${RECS.length}）`;
+  const box = $('hist-list'); box.innerHTML = '';
+  items.forEach(h => {
+    const d = new Date(h.ts); const ts = `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    const row = document.createElement('div'); row.className = 'hist-item';
+    const tm = document.createElement('time'); tm.textContent = ts;
+    const sp = document.createElement('span'); sp.textContent = h.sum || ''; sp.title = sp.textContent;
+    const tools = document.createElement('div'); tools.className = 'inline';
+    if (h.text) {
+      const b = document.createElement('button'); b.type = 'button'; b.className = 'ghost small'; b.textContent = '再複製';
+      b.onclick = () => { try { navigator.clipboard.writeText(h.text).then(() => { b.textContent = '已複製'; setTimeout(() => b.textContent = '再複製', 1400) }, () => { b.textContent = '無法複製' }) } catch (e) { b.textContent = '無法複製' } };
+      tools.appendChild(b);
+    }
+    const del = document.createElement('button'); del.type = 'button'; del.className = 'ghost small'; del.textContent = '移除';
+    del.onclick = () => {
+      if (del.dataset.confirm !== '1') { del.dataset.confirm = '1'; del.textContent = '確定移除？'; setTimeout(() => { del.dataset.confirm = ''; del.textContent = '移除' }, 2500); return }
+      RECS = RECS.filter(x => x !== h); saveRecs(); drawHist(); drawPool(); drawProgress();
+    };
+    tools.appendChild(del);
+    row.append(tm, sp, tools); box.appendChild(row);
+  });
+  if (!items.length) { const p = document.createElement('p'); p.className = 'hint'; p.textContent = '還沒有紀錄。按卡片上的「複製指令」就會記一筆。'; box.appendChild(p) }
+}
+function resetRecords() {
+  const range = $('reset-range').value, btn = $('reset-go'), msg = $('reset-msg');
+  const start = new Date(); start.setHours(0, 0, 0, 0);
+  const targets = RECS.filter(x => range === 'all' || x.ts >= start.getTime());
+  if (!targets.length) { msg.textContent = '沒有符合的紀錄'; return }
+  if (btn.dataset.confirm !== '1') { btn.dataset.confirm = '1'; btn.textContent = `確定刪除 ${targets.length} 筆？`; msg.textContent = '刪除後無法復原，再按一次才會執行'; setTimeout(() => { btn.dataset.confirm = ''; btn.textContent = '清除本機紀錄' }, 4000); return }
+  btn.dataset.confirm = ''; btn.textContent = '清除本機紀錄';
+  const ids = new Set(targets.map(x => x.id)); RECS = RECS.filter(x => !ids.has(x.id)); saveRecs(); drawHist(); drawPool(); drawProgress();
+  msg.textContent = `已刪除 ${targets.length} 筆，抽籤已重新計算`;
+  if (!cards.some(c => c.pinned)) generate();
+}
+
+/* ---------- 參數池統計 ---------- */
+function drawPool() {
+  const d = DATA; const allObj = new Set(), allPain = new Set();
+  Object.values(d.groups).forEach(g => { g.objs.forEach(o => allObj.add(o)); g.pains.forEach(p => allPain.add(p)) });
+  Object.values(d.tabPain).forEach(a => a.forEach(p => allPain.add(p)));
+  const rec = recentRecs();
+  const st = [[`近 ${windowDays} 天已用`, rec.length], ['品類', Object.keys(d.groups).length], ['療程', allObj.size], ['困擾', allPain.size], ['情境', d.scene.length], ['語氣', P.tone.length], ['觸發事件', TRIGGERS.length], ['範例文', LIB.length], ['禁用詞', SHEET_BAN.length]];
+  CATS.forEach(c => { const tot = d.scene.filter(s => s.cats.includes(c)).length; const usedN = new Set(rec.filter(x => x.tab === c).map(x => x.scene)).size; st.push([c + ' 情境 已用/總數', usedN + ' / ' + tot]) });
+  $('pool-stats').innerHTML = st.map(([k, v]) => `<div class="stat"><b>${v}</b><span>${esc(k)}</span></div>`).join('');
+  const rows = Object.entries(d.groups).map(([g, v]) => {
+    const tabs = CATS.filter(c => (d.tab[c] || []).includes(g)).map(c => SHORT[c]).join('、') || '—';
+    const sc = d.scene.filter(s => sceneOk(s, g) && (!s.only ? true : s.only.includes(g))).length;
+    const un = rec.filter(x => x.group === g).length;
+    return `<tr><td>${esc(g)}${v.surgery ? '（手術）' : ''}</td><td>${esc(tabs)}</td><td class="n">${v.weight == null ? '—' : v.weight}</td><td class="n${v.objs.length < 2 ? ' low' : ''}">${v.objs.length}</td><td class="n${v.pains.length < 3 ? ' low' : ''}">${v.pains.length}</td><td class="n${sc < 5 ? ' low' : ''}">${sc}</td><td class="n">${un}</td></tr>`;
+  }).join('');
+  const tp = Object.entries(d.tabPain).map(([c, a]) => `<tr><td>${esc(SHORT[c])}（分頁困擾）</td><td>${esc(SHORT[c])}</td><td class="n">—</td><td class="n">—</td><td class="n${a.length < 3 ? ' low' : ''}">${a.length}</td><td class="n">${d.scene.filter(s => s.cats.includes(c)).length}</td><td class="n">${rec.filter(x => x.tab === c).length}</td></tr>`).join('');
+  $('pool-table').innerHTML = '<thead><tr><th>品類</th><th>出現在</th><th class="n">籤數</th><th class="n">療程</th><th class="n">困擾</th><th class="n">可配情境</th><th class="n">近期已用</th></tr></thead><tbody>' + rows + tp + '</tbody>';
+  const wb = $('pool-warn-box');
+  wb.hidden = !poolWarns.length;
+  $('pool-warn-title').textContent = `Excel 有 ${poolWarns.length} 個地方要檢查`;
+  $('pool-warns').innerHTML = poolWarns.map(w => '<li>' + esc(w) + '</li>').join('');
+}
+
+/* ================= 初始化 ================= */
+function init() {
+  const tabs = $('tabs');
+  CATS.forEach(c => {
+    const b = document.createElement('button'); b.type = 'button'; b.className = 'tab'; b.id = 'tab-' + c; b.setAttribute('role', 'tab'); b.textContent = SHORT[c]; b.title = c;
+    b.onclick = () => { tab = c; store.set('cat', c); syncTabs(); syncTopic(); generate() }; tabs.appendChild(b);
+  });
+  const mixBox = $('mix');
+  CATS.forEach(c => {
+    const l = document.createElement('label'); l.htmlFor = 'mix-' + c; l.innerHTML = esc(SHORT[c]) + '<input type="number" min="0" max="10" id="mix-' + c + '">'; mixBox.appendChild(l);
+    const inp = l.querySelector('input'); inp.value = mix[c]; inp.oninput = () => { mix[c] = Math.max(0, +inp.value || 0); store.set('mix', JSON.stringify(mix)) };
+  });
+  document.querySelectorAll('[data-preset]').forEach(b => b.onclick = () => { mix = {...PRESETS[b.dataset.preset]}; CATS.forEach(c => $('mix-' + c).value = mix[c]); store.set('mix', JSON.stringify(mix)); generate() });
+  $('mode-single').onclick = () => { mode = 'single'; store.set('mode', mode); syncMode(); generate() };
+  $('mode-mix').onclick = () => { mode = 'mix'; store.set('mode', mode); syncMode(); generate() };
+
+  opts('f-gender', ['女', '男']); opts('f-who', [...new Set(P.who)]); opts('f-exp', P.exp); opts('f-budget', P.budget); opts('f-trigger', P.trigger);
+  opts('f-tone', P.tone);
+  opts('f-len', P.len.map(n => n + ' 字'), '隨機（多數 35–90 字）');
+  [['f-ban', 'ban'], ['f-avoid', 'avoid'], ['f-kw', 'kw'], ['f-note', 'note']].forEach(([i, k]) => { $(i).value = store.get(k) || ''; $(i).addEventListener('input', () => store.set(k, $(i).value)) });
+  $('form').addEventListener('change', e => {
+    if (e.target.tagName !== 'SELECT') return; mark(e.target);
+    if (e.target.id === 'f-group') syncTopic();
+    if (e.target.id === 'f-region') syncRegion();
+  });
+  // 手機：產生後直接捲到卡片
+  const goCards = () => { if (matchMedia('(max-width:860px)').matches) { const el = $('progress').hidden ? $('cards') : $('progress'); el.scrollIntoView({behavior: 'smooth', block: 'start'}) } };
+  $('form').addEventListener('submit', e => { e.preventDefault(); generate(); goCards() });
+  if ($('go-m')) $('go-m').onclick = () => { generate(); goCards() };
+  if ($('pool-pill')) $('pool-pill').onclick = () => { const w = $('pool-wrap'); w.open = true; w.scrollIntoView({behavior: 'smooth', block: 'start'}) };
+  $('regen').onclick = generate;
+  $('clearpin').onclick = () => { cards.forEach(c => c.pinned = false); draw(); saveCards() };
+  $('reset').onclick = () => { advSelects().forEach(s => { s.value = R }); syncTopic(); advSelects().forEach(mark) };
+  const togglePush = () => { const manual = !$('f-pushrand').checked; $('push-counts').style.opacity = manual ? 1 : .4; ['f-b', 'f-n'].forEach(i => $(i).disabled = !manual) };
+  $('f-pushrand').addEventListener('change', togglePush); togglePush();
+  $('reset-go').onclick = resetRecords;
+  {
+    const tst = $('f-test'); try { tst.checked = sessionStorage.getItem(KEY + 'test') === '1' } catch (e) {}
+    const sync = () => { $('testbar').hidden = !tst.checked; drawProgress(); try { sessionStorage.setItem(KEY + 'test', tst.checked ? '1' : '0') } catch (e) {} };
+    tst.addEventListener('change', sync); $('test-off').onclick = () => { tst.checked = false; sync() }; sync();
+  }
+  $('f-win').value = String(windowDays);
+  $('f-win').addEventListener('change', () => { windowDays = +$('f-win').value; store.set('win', String(windowDays)); drawPool() });
+  {
+    const cur = new Date().getMonth() + 1; const el = $('f-month');
+    for (let m = 1; m <= 12; m++) { const o = document.createElement('option'); o.value = String(m); o.textContent = m + ' 月' + (m === cur ? '（本月）' : ''); el.appendChild(o) }
+    el.value = String(cur);
+    el.addEventListener('change', () => { MONTH = +el.value; generate() });
+  }
+  $('pool-refresh').onclick = loadPool;
+  const fileIn = $('pool-file');
+  [$('pool-pick'), $('pick-big')].forEach(b => b.onclick = () => fileIn.click());
+  fileIn.addEventListener('change', () => { onPickFile(fileIn.files[0]); fileIn.value = '' });
+  $('go').disabled = true; if ($('go-m')) $('go-m').disabled = true;
+  syncTabs(); syncTopic(); syncMode(); syncRegion(); drawHist();
+  if (!restoreCards()) draw();
+  drawPool(); loadPool();
+}
+init();
