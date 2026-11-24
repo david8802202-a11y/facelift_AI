@@ -586,17 +586,19 @@ function multiItems(type, r, t, used) {
 
 /* ---------- 地區與診所 ---------- */
 const isClinicAxis = s => s.type === '求推' || s.type === '診所主軸';
+// 明確在找診所的文（求推類型，或情境說明有推薦、名單）：診所抽 4–5 間、推文 4–6 則提到診所
+const seeksClinic = s => s.type === '求推' || /名單|推薦|求推|徵求/.test(s.desc + s.dir);
 const placeName = (city, area) => !area || area === city ? city : `${city} ${area}`;
 function pickCity(cities, exclude) { const c = cities.filter(x => x !== exclude && (CITY_W[x] || 0) > 0); return c.length ? wpick(c, x => CITY_W[x]) : null }
 // 從某個城市抽 2–3 間：先抽一個區（診所多的區比較常抽到），同區不夠再從同城市補；避開最近用過的
-function pickClinics(city, surg, t, used) {
+function pickClinics(city, surg, t, used, want) {
   let pool = CLINICS.filter(c => c.city === city && (!surg || c.surg));
   if (!pool.length) pool = CLINICS.filter(c => c.city === city);
   if (!pool.length) return null;
   const area = pick(pool).area;
   const inArea = [...new Set(pool.filter(c => c.area === area).map(c => c.name))];
   const inCity = [...new Set(pool.map(c => c.name))];
-  const n = Math.min(inCity.length, pick([2, 3]));
+  const n = Math.min(inCity.length, want || pick([2, 3]));
   const names = [];
   while (names.length < n) {
     let c = inArea.filter(x => !names.includes(x)); if (!c.length) c = inCity.filter(x => !names.includes(x));
@@ -719,6 +721,7 @@ function roll(t, used) {
   const fixedCity = rv !== R && rv !== '__none' ? rv : null;
   r.region = null; r.clinics = null; r.home = null; r.cross = false; r.bodyClinics = []; r.negClinic = false; r.cClinics = [];
   r.clinicAxis = isClinicAxis(r.scene);
+  r.seekClinic = r.clinicAxis && seeksClinic(r.scene);
   const cities = regionCities();
   if (rv !== '__none' && !r.share && cities.length) {
     const surg = !!(G && G.surgery);
@@ -729,7 +732,7 @@ function roll(t, used) {
         const surgCities = [...new Set(CLINICS.filter(c => c.surg).map(c => c.city))].filter(c => cities.includes(c));
         const o = pickCity(surgCities, r.home); if (o) { target = o; r.cross = true }
       }
-      const pc = pickClinics(target, surg, t, used);
+      const pc = pickClinics(target, surg, t, used, r.seekClinic ? pick([4, 5]) : null);
       if (pc) {
         r.region = placeName(target, pc.area); r.clinics = pc.names; pc.names.forEach(n => used.add('clinic', t, n, 5));
         r.negClinic = NEG_CLINIC_SCENES.includes(r.scene.name) || NEG_PAIN_RE.test(r.pain);
@@ -878,14 +881,32 @@ function roll(t, used) {
       r.cBrands = bs.slice(0, at.length);
       if (!r.cBrands.length) r.gmode = 'A';
     }
-    // 求推、診所主軸：安排 1–3 則推文推薦或分享診所（只用推薦或中性說法，不寫負評）
+    // 診所推文：明確在找診所的文 4–6 則（其中一組相鄰兩則推同一間，像「樓上推 +1」）；其他診所主軸 1–3 則
+    //   只用推薦或中性說法，不寫負評
     if (r.push && r.clinics && r.clinics.length) {
-      const k = Math.min(r.clinics.length, wpick([1, 2, 3], x => ({1: 30, 2: 45, 3: 25})[x]));
       const free = r.cPlan.map((c, i) => i).filter(i => i >= 1 && r.cPlan[i].pf === '推|' && !/問句|講自己做的是/.test(r.cPlan[i].d));
-      const at = sample(free, Math.min(k, free.length)).sort((a, b) => a - b);
-      const names = sample(r.clinics, at.length);
-      at.forEach((i, j) => { r.cPlan[i] = {pf: '推|', d: pick([`推薦「${names[j]}」，講一個具體的好處，一句帶過，不要像業配`, `說自己在「${names[j]}」做過，感覺還可以，講一個小細節`, `說朋友在「${names[j]}」做過，評價不錯，一句帶過`])} });
-      r.cClinics = names;
+      const rec = nm => pick([`推薦「${nm}」，講一個具體的好處，一句帶過，不要像業配`, `說自己在「${nm}」做過，感覺還可以，講一個小細節`, `說朋友在「${nm}」做過，評價不錯，一句帶過`]);
+      const mentions = [];
+      if (r.seekClinic) {
+        const k = Math.min(free.length, rint(4, 6), r.clinics.length + 1);
+        const names = sample(r.clinics, Math.max(1, k - 1));
+        // 找相鄰、而且不跨第一批和第二批的兩格，放「推某間」＋「接上一則也推同一間」
+        const fs = new Set(free);
+        const pairs = free.filter(i => fs.has(i + 1) && i + 1 !== r.wave1);
+        const plusAt = k >= 2 && pairs.length ? pick(pairs) : null;
+        const at = (plusAt != null ? [...sample(free.filter(i => i !== plusAt && i !== plusAt + 1), k - 2), plusAt] : sample(free, k)).sort((a, b) => a - b);
+        at.forEach((i, j) => {
+          const nm = names[j % names.length];
+          r.cPlan[i] = {pf: '推|', d: rec(nm)}; mentions.push(nm);
+          if (i === plusAt) { r.cPlan[i + 1] = {pf: '推|', d: `接上一則，也推「${nm}」，補一句自己在那邊的體驗，不要只寫+1`}; mentions.push(nm) }
+        });
+      } else {
+        const k = Math.min(r.clinics.length, wpick([1, 2, 3], x => ({1: 30, 2: 45, 3: 25})[x]));
+        const at = sample(free, Math.min(k, free.length)).sort((a, b) => a - b);
+        const names = sample(r.clinics, at.length);
+        at.forEach((i, j) => { r.cPlan[i] = {pf: '推|', d: rec(names[j])}; mentions.push(names[j]) });
+      }
+      r.cClinics = [...new Set(mentions)]; r.cClinicN = mentions.length;
     }
   }
   // 範例：同品類、同標籤、字數相近，且跟這篇的寫法規則不衝突
@@ -964,7 +985,7 @@ function promptText(r) {
   if (r.extra) {
     if (r.extra.k === 'region') {
       // 要找診所的文才寫「想找這一區」；討論類只在自然時順帶
-      const seek = isAsk(r.scene) || /名單|推薦|求推|徵求/.test(r.scene.desc + r.scene.dir);
+      const seek = seeksClinic(r.scene);
       L.push(r.cross ? `地區：發文者住${r.home}，但想跑到${r.region}找整外，帶一句為什麼願意跑遠`
         : seek ? `地區：${r.region}，帶一句想找這一區的就好` : `地區：${r.region}，自然的話順帶一句自己在這一區看診所，不自然就不提`);
     }
@@ -1015,7 +1036,7 @@ function promptText(r) {
     L.push(`照下面的安排寫：「推|」「噓|」照寫${r.cBoo ? '，噓文是不認同發文者的想法或對這個做法有負面看法，語氣可以直但不要人身攻擊' : ''}；「→|」是中立推文，輸出時那一行前面不加任何符號；冒號後面的說明不要寫進推文`);
     r.cPlan.forEach((c, i) => { if (i === r.wave1) L.push('（這裡空一行，接第二批）'); L.push(`第${i + 1}則 ${c.pf}：${c.d}`) });
     const rules = [
-      '10 則講的事都要不一樣；直接回應發文者擔心或想問的那件事最多兩則，其他照安排寫',
+      r.seekClinic && r.cClinicN ? '10 則講的事都要不一樣，但「接上一則也推同一間」那則可以跟前一則推同一間；安排好推薦診所的那幾則照寫，其他推文不要再回應找診所這件事' : '10 則講的事都要不一樣；直接回應發文者擔心或想問的那件事最多兩則，其他照安排寫',
       `每則推文就是一行，不要把一則拆成兩行寫；沒有加「推|」「噓|」的行整串剛好 ${r.cNeu} 行`,
       '推文是一般網友隨手回，不要像診所衛教或業配；講原理的推文整串最多一則，不要用「專業評估」「建議諮詢」這種說法',
       `講療程效果、其他療程或注意事項要符合一般醫美常識，不確定就講自己的感受；${r.cClinics.length ? '除了安排好提診所的那幾則，其他推文不要提具體診所；提到的診所都不能說壞話；都不要提醫師名字' : '不要提具體診所或醫師名字'}`,
