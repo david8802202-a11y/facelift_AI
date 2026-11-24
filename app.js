@@ -588,6 +588,14 @@ function multiItems(type, r, t, used) {
 const isClinicAxis = s => s.type === '求推' || s.type === '診所主軸';
 // 明確在找診所的文（求推類型，或情境說明有推薦、名單）：診所抽 4–5 間、推文 4–6 則提到診所
 const seeksClinic = s => s.type === '求推' || /名單|推薦|求推|徵求/.test(s.desc + s.dir);
+// 補充要求或必提關鍵字有要求推薦診所：這批每篇都當成在找診所；有寫城市就用那個城市
+const NOTE_SEEK_RE = /推薦.{0,6}(診所|醫師|醫生|名單)|(診所|醫師|醫生).{0,4}推薦|求推|名單/;
+function noteSeek() {
+  const s = ($('f-note').value + ' ' + $('f-kw').value).replace(/臺/g, '台');
+  if (!NOTE_SEEK_RE.test(s)) return null;
+  const city = Object.keys(CITY_W).find(c => s.includes(c)) || (/雙北/.test(s) ? pick(['台北', '新北']) : null);
+  return {city};
+}
 const placeName = (city, area) => !area || area === city ? city : `${city} ${area}`;
 function pickCity(cities, exclude) { const c = cities.filter(x => x !== exclude && (CITY_W[x] || 0) > 0); return c.length ? wpick(c, x => CITY_W[x]) : null }
 // 從某個城市抽 2–3 間：先抽一個區（診所多的區比較常抽到），同區不夠再從同城市補；避開最近用過的
@@ -720,22 +728,27 @@ function roll(t, used) {
   const rv = $('f-region').value;
   const fixedCity = rv !== R && rv !== '__none' ? rv : null;
   r.region = null; r.clinics = null; r.home = null; r.cross = false; r.bodyClinics = []; r.negClinic = false; r.cClinics = [];
-  r.clinicAxis = isClinicAxis(r.scene);
-  r.seekClinic = r.clinicAxis && seeksClinic(r.scene);
+  const ns = noteSeek();
+  r.noteSeek = !!ns;
+  r.clinicAxis = isClinicAxis(r.scene) || r.noteSeek;
+  r.seekClinic = r.noteSeek || (r.clinicAxis && seeksClinic(r.scene));
   const cities = regionCities();
-  if (rv !== '__none' && !r.share && cities.length) {
+  const noteCity = ns && ns.city && cities.includes(ns.city) ? ns.city : null;
+  if ((rv !== '__none' || r.noteSeek) && !r.share && cities.length) {
     const surg = !!(G && G.surgery);
     if (r.clinicAxis && CLINICS.length) {
-      r.home = fixedCity || pickCity(cities);
+      r.home = noteCity || fixedCity || pickCity(cities);
       let target = r.home;
-      if (surg && Math.random() < CROSS_RATE) {
+      if (surg && !noteCity && Math.random() < CROSS_RATE) {
         const surgCities = [...new Set(CLINICS.filter(c => c.surg).map(c => c.city))].filter(c => cities.includes(c));
         const o = pickCity(surgCities, r.home); if (o) { target = o; r.cross = true }
       }
       const pc = pickClinics(target, surg, t, used, r.seekClinic ? pick([4, 5]) : null);
       if (pc) {
         r.region = placeName(target, pc.area); r.clinics = pc.names; pc.names.forEach(n => used.add('clinic', t, n, 5));
-        r.negClinic = NEG_CLINIC_SCENES.includes(r.scene.name) || NEG_PAIN_RE.test(r.pain);
+        // 困擾有寫進指令、而且是在抱怨診所，正文才不點名（擔心類情境不寫困擾，就不算）
+        const painShown = !(t === '閒聊趣味' && !G) && !(r.fear && !r.share);
+        r.negClinic = NEG_CLINIC_SCENES.includes(r.scene.name) || (painShown && NEG_PAIN_RE.test(r.pain));
         if (!r.negClinic) r.bodyClinics = r.clinics.slice(0, wpick([0, 1, 2], x => ({0: 30, 1: 35, 2: 35})[x]));
       } else r.cross = false;
     } else if (r.clinicAxis || t === '醫美診所') {
@@ -770,7 +783,7 @@ function roll(t, used) {
   r.blank = r.share ? Math.random() < .75 : Math.random() < .5;
   r.askEnd = !r.share && (isAsk(r.scene) || Math.random() < (r.tag === '閒聊' ? .3 : .5));
   // 情境要互動、要推薦、要大家討論的：結尾一定要問，標籤不用閒聊
-  r.mustAsk = !r.share && ASK_SCENE_RE.test(r.scene.desc + r.scene.dir);
+  r.mustAsk = !r.share && (r.noteSeek || ASK_SCENE_RE.test(r.scene.desc + r.scene.dir));
   if (r.mustAsk) { r.askEnd = true; if (!tv && r.tag === '閒聊') r.tag = '討論' }
   r.push = t !== '空包彈';
   if (r.gmode === 'C') r.askEnd = true;
@@ -915,7 +928,7 @@ function roll(t, used) {
 }
 
 /* ================= 組指令 ================= */
-function clinicFocus(r) { return r.tab === '醫美診所' || r.scene.type === '求推' || r.scene.type === '診所主軸' }
+function clinicFocus(r) { return r.tab === '醫美診所' || r.scene.type === '求推' || r.scene.type === '診所主軸' || !!r.noteSeek }
 function stripClinicAsk(d) {
   const parts = d.split(/(?<=[，。；？?！!])/);
   const bad = /(求推|推薦|名單|找).{0,20}(診所|醫師|醫生)|(診所|醫師|醫生).{0,8}(推薦|求推)|安心診所|挑選醫生|挑醫生|的醫師|的診所/;
@@ -985,7 +998,7 @@ function promptText(r) {
   if (r.extra) {
     if (r.extra.k === 'region') {
       // 要找診所的文才寫「想找這一區」；討論類只在自然時順帶
-      const seek = seeksClinic(r.scene);
+      const seek = r.seekClinic || seeksClinic(r.scene);
       L.push(r.cross ? `地區：發文者住${r.home}，但想跑到${r.region}找整外，帶一句為什麼願意跑遠`
         : seek ? `地區：${r.region}，帶一句想找這一區的就好` : `地區：${r.region}，自然的話順帶一句自己在這一區看診所，不自然就不提`);
     }
